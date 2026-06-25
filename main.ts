@@ -52,6 +52,14 @@ export default class ObsidianPaperless extends Plugin {
 			}
 		});
 
+		this.addCommand({
+			id: 'import-missing-paperless',
+			name: 'Import missing documents',
+			editorCallback: async (editor: Editor) => {
+				await importMissingDocuments(this.app, editor, this.settings);
+			}
+		});
+
 		this.addSettingTab(new SettingTab(this.app, this));
 	}
 
@@ -273,6 +281,50 @@ async function createDocument(app: App, editor: Editor, settings: PluginSettings
 	}
 
 	editor.replaceRange('![[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
+}
+
+async function importMissingDocuments(app: App, editor: Editor, settings: PluginSettings) {
+	const content = editor.getValue();
+	const pattern = /!?\[\[paperless-(\d+)\.pdf\]\]/g;
+	const documentIds = new Set<string>();
+	let match;
+	while ((match = pattern.exec(content)) !== null) {
+		documentIds.add(match[1]);
+	}
+
+	if (documentIds.size === 0) {
+		new Notice('No paperless document links found in this note.');
+		return;
+	}
+
+	const folderPath = normalizePath(settings.documentStoragePath);
+	if (folderPath) {
+		const folderRef = app.vault.getAbstractFileByPath(folderPath);
+		const folderExists = !!(folderRef) && folderRef instanceof TFolder;
+		if (!folderExists) {
+			await app.vault.createFolder(folderPath);
+		}
+	}
+
+	let importedCount = 0;
+	for (const documentId of documentIds) {
+		const filename = 'paperless-' + documentId + '.pdf';
+		const fileRef = app.vault.getAbstractFileByPath(folderPath + '/' + filename);
+		const fileExists = !!(fileRef) && fileRef instanceof TFile;
+		if (!fileExists) {
+			const shareLink = await getShareLink(settings, documentId);
+			if (shareLink) {
+				const response = await requestUrl({
+					url: shareLink.href,
+					method: 'GET'
+				});
+				await app.vault.createBinary(folderPath + '/' + filename, response.arrayBuffer);
+				importedCount++;
+			}
+		}
+	}
+
+	new Notice(`Imported ${importedCount} of ${documentIds.size} document(s).`);
 }
 
 async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: string, tagIds: number[] = []): Promise<string[]> {
