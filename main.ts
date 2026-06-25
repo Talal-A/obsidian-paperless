@@ -167,6 +167,15 @@ function searchPaperlessUrl(editor: Editor, settings: PluginSettings): Paperless
 		}
 	}
 
+	// also match [[paperless-{id}.pdf]] wiki links
+	const wikiLinkMatch = text.match(/\[\[paperless-(\d+)\.pdf\]\]/);
+	if (wikiLinkMatch) {
+		return {
+			documentId: wikiLinkMatch[1],
+			range: wordRange
+		};
+	}
+
 	// nothing found
 	return null;
 }
