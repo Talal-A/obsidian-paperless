@@ -641,7 +641,7 @@ class DocumentSelectorModal extends Modal {
 			imgElement.width = (totalWidth / 2) - 5;
 			imgElement.style.cursor = 'pointer';
 
-			imgElement.onclick = () => {
+			imgElement.onclick = async () => {
 				const cursor = this.editor.getCursor();
 				const documentInfo: PaperlessInsertionData = {
 					documentId: documentId,
@@ -650,8 +650,8 @@ class DocumentSelectorModal extends Modal {
 						to: { line: cursor.line, ch: cursor.ch }
 					}
 				}
-				createDocument(this.app, this.editor, this.settings, documentInfo);
-				overallDiv.setCssStyles({opacity: '0.5'});
+				await createDocument(this.app, this.editor, this.settings, documentInfo);
+				this.close();
 			};
 
 			imgElement.onerror = () => {
