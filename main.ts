@@ -1,4 +1,4 @@
-import { App, Editor, EditorRange, MarkdownView, Modal, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting, setIcon, TFolder, TFile } from 'obsidian';
+import { App, Editor, EditorRange, Modal, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting, TFolder, TFile } from 'obsidian';
 import { escapeRegExp } from 'lodash';
 
 interface PluginSettings {
@@ -77,7 +77,7 @@ export default class ObsidianPaperless extends Plugin {
 }
 
 let cachedResult: RequestUrlResponse;
-let tagCache = new Map();
+const tagCache = new Map();
 
 async function testConnection(settings: PluginSettings) {
 	new Notice("Testing connection to " + settings.paperlessUrl)
@@ -118,7 +118,7 @@ async function refreshCacheFromPaperless(settings: PluginSettings, silent=true) 
 		}
 	})
 	for (let i = 0; i < tagResult.json['results'].length; i++) {
-		let current = tagResult.json['results'][i];
+		const current = tagResult.json['results'][i];
 		tagCache.set(current['id'], current);
 	}
 	if(!silent) {
@@ -204,7 +204,7 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 			console.error("An exception occurred in getExistingShareLink. Response: " + result);
 			return null;
 		}
-		for (let item of result.json) {
+		for (const item of result.json) {
 			if (item['expiration'] == null)  {
 				return new URL(settings.paperlessUrl + '/share/' + item['slug']);
 			}
@@ -395,7 +395,7 @@ class DocumentSelectorModal extends Modal {
 			}
 		})
 		imgElement.src = URL.createObjectURL(new Blob([result.arrayBuffer]));
-	};
+	}
 
 	async displayTags(tagDiv: HTMLDivElement, documentId: string) {
 		const thumbUrl = this.settings.paperlessUrl + '/api/documents/' + documentId + '/';
@@ -413,7 +413,7 @@ class DocumentSelectorModal extends Modal {
 			tagStr.setCssStyles({color: tagData['text_color'], fontSize: '0.7em'});
 			currentTag.setCssStyles({background: tagData['color'], borderRadius: '8px', padding: '2px', marginTop: '1px', marginRight: '5px'})
 		}
-	};
+	}
 
 	async onOpen() {
 		const {contentEl} = this;
@@ -514,7 +514,7 @@ class DocumentSelectorModal extends Modal {
 		};
 
 		const totalWidth = contentEl.innerWidth;
-		this.availableDocumentIds = cachedResult.json['results'].map((d: Record<string, any>) => d.id.toString()).sort((a:String, b:String) => {return +a - +b}).reverse();
+		this.availableDocumentIds = cachedResult.json['results'].map((d: Record<string, any>) => d.id.toString()).sort((a:string, b:string) => {return +a - +b}).reverse();
 		const totalAssets = this.availableDocumentIds.length;
 
 		// Create scroll container
@@ -545,7 +545,7 @@ class DocumentSelectorModal extends Modal {
 
 			if (searchQuery === '' && this.selectedTags.size === 0) {
 				// Reset to cached results
-				this.availableDocumentIds = cachedResult.json['results'].map((d: Record<string, any>) => d.id.toString()).sort((a:String, b:String) => {return +a - +b}).reverse();
+				this.availableDocumentIds = cachedResult.json['results'].map((d: Record<string, any>) => d.id.toString()).sort((a:string, b:string) => {return +a - +b}).reverse();
 			} else {
 				// Perform search
 				searchInput.disabled = true;
@@ -555,7 +555,7 @@ class DocumentSelectorModal extends Modal {
 				try {
 					const tagIds = Array.from(this.selectedTags);
 					const searchResults = await searchPaperlessDocuments(this.settings, searchQuery, tagIds);
-					this.availableDocumentIds = searchResults.sort((a:String, b:String) => {return +a - +b}).reverse();
+					this.availableDocumentIds = searchResults.sort((a:string, b:string) => {return +a - +b}).reverse();
 				} catch (error) {
 					new Notice('Failed to search documents');
 					console.error('Search failed:', error);
