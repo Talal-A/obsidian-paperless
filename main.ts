@@ -5,6 +5,7 @@ interface PluginSettings {
 	paperlessUrl: string;
 	paperlessAuthToken: string;
 	documentStoragePath: string;
+	embedDocuments: boolean;
 }
 
 interface PaperlessInsertionData {
@@ -15,7 +16,8 @@ interface PaperlessInsertionData {
 const DEFAULT_SETTINGS: PluginSettings = {
 	paperlessUrl: '',
 	paperlessAuthToken: '',
-	documentStoragePath: ''
+	documentStoragePath: '',
+	embedDocuments: true
 }
 
 export default class ObsidianPaperless extends Plugin {
@@ -280,7 +282,8 @@ async function createDocument(app: App, editor: Editor, settings: PluginSettings
 		}
 	}
 
-	editor.replaceRange('![[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
+	const linkPrefix = settings.embedDocuments ? '![' : '[';
+	editor.replaceRange(linkPrefix + '[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
 }
 
 async function importMissingDocuments(app: App, editor: Editor, settings: PluginSettings) {
@@ -720,6 +723,15 @@ class SettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.documentStoragePath)
 				.onChange(async (value) => {
 					this.plugin.settings.documentStoragePath = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName('Embed documents')
+			.setDesc('When enabled, new documents are inserted as embedded PDFs (![[...]]). Otherwise as links ([[...]]).')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.embedDocuments)
+				.onChange(async (value) => {
+					this.plugin.settings.embedDocuments = value;
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
