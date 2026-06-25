@@ -216,7 +216,9 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 	return null;
 }
 
-async function createShareLink(settings: PluginSettings, documentId: string) {
+type ShareLinkFileVersion = 'archive' | 'original';
+
+async function createShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion) {
 	const url = new URL(settings.paperlessUrl + '/api/share_links/');
 	let result;
 	try {
@@ -224,36 +226,41 @@ async function createShareLink(settings: PluginSettings, documentId: string) {
 			url: url.toString(),
 			method: 'POST',
 			contentType: 'application/json',
-			body: '{"document":' + documentId + ',"file_version":"original"}',
+			body: JSON.stringify({ document: documentId, file_version: fileVersion }),
 			headers: {
 				'Authorization': 'token ' + settings.paperlessAuthToken
 			}
 		})
-		if (result.status != 201) {
-			console.error("An exception occurred in createShareLink. Response: " + result);
-		}
+		return result.status === 201;
 	} catch (e) {
 		console.error("An exception occurred in createShareLink. Exception: " + e + " and response " + result);
+		return false;
 	}
 }
 
-async function getShareLink(settings: PluginSettings, documentId: string) {
-	let link = await getExistingShareLink(settings, documentId);
-	if (!link) {
-		createShareLink(settings, documentId);
-		link = await getExistingShareLink(settings, documentId);
-		if (link == null) {
-			// Sometimes this takes a while, give it five immediate retries before giving up.
-			for (let i = 0; i < 5; i++) {
-				link = await getExistingShareLink(settings, documentId);
-				if (link) {
-					break;
-				}
-			}
+async function findShareLink(settings: PluginSettings, documentId: string, attempts = 1) {
+	for (let i = 0; i < attempts; i++) {
+		const link = await getExistingShareLink(settings, documentId);
+		if (link) {
+			return link;
 		}
 	}
 
-	return link;
+	return null;
+}
+
+async function createAndFindShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion) {
+	if (await createShareLink(settings, documentId, fileVersion)) {
+		return await findShareLink(settings, documentId, 6);
+	}
+
+	return null;
+}
+
+async function getShareLink(settings: PluginSettings, documentId: string) {
+	return await findShareLink(settings, documentId)
+		?? await createAndFindShareLink(settings, documentId, 'archive')
+		?? await createAndFindShareLink(settings, documentId, 'original');
 }
 
 // Heavily inspired by https://github.com/RyotaUshio/obsidian-pdf-plus/blob/127ea5b94bb8f8fa0d4c66bcd77b3809caa50b21/src/modals/external-pdf-modals.ts#L249
