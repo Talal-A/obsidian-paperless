@@ -79,6 +79,53 @@ export default class ObsidianPaperless extends Plugin {
 let cachedResult: RequestUrlResponse;
 const tagCache = new Map();
 
+interface PaginatedResponse<T> {
+	response: RequestUrlResponse;
+	results: T[];
+}
+
+async function fetchAllPages<T>(initialUrl: URL, settings: PluginSettings): Promise<PaginatedResponse<T>> {
+	const visitedUrls = new Set<string>();
+	let nextUrl: string | null = initialUrl.toString();
+	let firstResponse: RequestUrlResponse | null = null;
+	const results: T[] = [];
+
+	while (nextUrl !== null) {
+		if (visitedUrls.has(nextUrl)) {
+			throw new Error('Pagination loop detected');
+		}
+		visitedUrls.add(nextUrl);
+
+		const result = await requestUrl({
+			url: nextUrl,
+			headers: {
+				'Authorization': 'token ' + settings.paperlessAuthToken
+			}
+		});
+		firstResponse ??= result;
+
+		if (result.status < 200 || result.status >= 300) {
+			throw new Error('Paperless returned HTTP ' + result.status);
+		}
+
+		const payload = result.json;
+		if (!payload || !Array.isArray(payload.results) ||
+			!Object.prototype.hasOwnProperty.call(payload, 'next') ||
+			(payload.next !== null && typeof payload.next !== 'string')) {
+			throw new Error('Paperless returned an invalid paginated response');
+		}
+
+		results.push(...payload.results);
+		nextUrl = payload.next === null ? null : new URL(payload.next, nextUrl).toString();
+	}
+
+	if (!firstResponse) {
+		throw new Error('Paperless returned no response');
+	}
+
+	return {response: firstResponse, results};
+}
+
 async function testConnection(settings: PluginSettings) {
 	new Notice("Testing connection to " + settings.paperlessUrl)
 	const url = new URL(settings.paperlessUrl + '/api/documents/');
@@ -100,25 +147,15 @@ async function testConnection(settings: PluginSettings) {
 
 async function refreshCacheFromPaperless(settings: PluginSettings, silent=true) {
 	const url = new URL(settings.paperlessUrl + '/api/documents/?format=json');
-	const result = await requestUrl({
-		url: url.toString(),
-		headers: {
-			'Authorization': 'token ' + settings.paperlessAuthToken
-		}
-	})
-	cachedResult = result;
+	const documentResult = await fetchAllPages<Record<string, any>>(url, settings);
+	cachedResult = documentResult.response;
+	cachedResult.json['results'] = documentResult.results;
 
 	// Cache data relating to tags
 	const tagUrl = new URL(settings.paperlessUrl + '/api/tags/?format=json');
-	const tagResult = await requestUrl({
-		url: tagUrl.toString(),
-		headers: {
-			"accept": "application/json; version=5",
-			'Authorization': 'token ' + settings.paperlessAuthToken
-		}
-	})
-	for (let i = 0; i < tagResult.json['results'].length; i++) {
-		const current = tagResult.json['results'][i];
+	const tagResult = await fetchAllPages<Record<string, any>>(tagUrl, settings);
+	for (let i = 0; i < tagResult.results.length; i++) {
+		const current = tagResult.results[i];
 		tagCache.set(current['id'], current);
 	}
 	if(!silent) {
@@ -207,7 +244,8 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 			console.error("An exception occurred in getExistingShareLink. Response: " + result);
 			return null;
 		}
-		for (const item of result.json) {
+		const shareLinks = await fetchAllPages<Record<string, any>>(url, settings);
+		for (const item of shareLinks.results) {
 			const expiration = item['expiration'];
 			if (item['file_version'] == fileVersion && item['slug'] &&
 				(expiration == null || new Date(expiration).getTime() > Date.now())) {
@@ -367,7 +405,7 @@ async function importMissingDocuments(app: App, editor: Editor, settings: Plugin
 async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: string, tagIds: number[] = []): Promise<string[]> {
 	let urlStr = settings.paperlessUrl + '/api/documents/?format=json';
 	if (searchQuery) {
-		urlStr += '&title_content=' + encodeURIComponent(searchQuery);
+		urlStr += '&text=' + encodeURIComponent(searchQuery);
 	}
 	if (tagIds.length > 0) {
 		urlStr += '&tags__id__all=' + tagIds.join(',');
@@ -375,17 +413,8 @@ async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: s
 	console.log("Querying " + urlStr)
 	const url = new URL(urlStr);
 	try {
-		const result = await requestUrl({
-			url: url.toString(),
-			headers: {
-				'Authorization': 'token ' + settings.paperlessAuthToken
-			}
-		});
-		if (result.status === 200 && result.json['results']) {
-			return result.json['results'].map((d: Record<string, any>) => d.id.toString());
-		}
-		console.error('Search returned unexpected response:', result);
-		return [];
+		const result = await fetchAllPages<Record<string, any>>(url, settings);
+		return result.results.map((d: Record<string, any>) => d.id.toString());
 	} catch (error) {
 		console.error('Error searching Paperless:', error);
 		throw error;
@@ -402,6 +431,7 @@ class DocumentSelectorModal extends Modal {
 	isLoading: boolean;
 	scrollTimeout: number | null;
 	searchTimeout: number | null;
+	searchGeneration: number;
 	selectedTags: Set<number>;
 	availableDocumentIds: string[];
 
@@ -416,6 +446,7 @@ class DocumentSelectorModal extends Modal {
 		this.isLoading = false;
 		this.scrollTimeout = null;
 		this.searchTimeout = null;
+		this.searchGeneration = 0;
 		this.selectedTags = new Set();
 		this.availableDocumentIds = [];
 	}
@@ -443,6 +474,9 @@ class DocumentSelectorModal extends Modal {
 		for (let x = 0; x < tags.length; x++) {
 			const currentTag = tagDiv.createDiv();
 			const tagData = tagCache.get(tags[x]);
+			if (!tagData) {
+				continue;
+			}
 			const tagStr = currentTag.createEl('span', {text: tagData['name']});
 			tagStr.setCssStyles({color: tagData['text_color'], fontSize: '0.7em'});
 			currentTag.setCssStyles({background: tagData['color'], borderRadius: '8px', padding: '2px', marginTop: '1px', marginRight: '5px'})
@@ -569,12 +603,14 @@ class DocumentSelectorModal extends Modal {
 		loadingDiv.style.display = 'none';
 
 		searchInput.addEventListener('input', async (e) => {
+			const requestId = ++this.searchGeneration;
 			if (this.searchTimeout) {
 				clearTimeout(this.searchTimeout);
 			}
 
 			// Debounce: wait 500ms after user stops typing
 			this.searchTimeout = window.setTimeout(async () => {
+				if (requestId !== this.searchGeneration) return;
 				const searchQuery = (e.target as HTMLInputElement).value.trim();
 
 			if (searchQuery === '' && this.selectedTags.size === 0) {
@@ -589,14 +625,18 @@ class DocumentSelectorModal extends Modal {
 				try {
 					const tagIds = Array.from(this.selectedTags);
 					const searchResults = await searchPaperlessDocuments(this.settings, searchQuery, tagIds);
+					if (requestId !== this.searchGeneration) return;
 					this.availableDocumentIds = searchResults.sort((a:string, b:string) => {return +a - +b}).reverse();
 				} catch (error) {
+					if (requestId !== this.searchGeneration) return;
 					new Notice('Failed to search documents');
 					console.error('Search failed:', error);
 					loadingDiv.style.display = 'none';
 				} finally {
-					searchInput.disabled = false;
-					loadingDiv.style.display = 'none';
+					if (requestId === this.searchGeneration) {
+						searchInput.disabled = false;
+						loadingDiv.style.display = 'none';
+					}
 				}
 			}				// Reset and reload modal content
 				this.currentPage = 0;
@@ -709,6 +749,7 @@ class DocumentSelectorModal extends Modal {
 	}
 
 	onClose() {
+		this.searchGeneration++;
 		if (this.scrollTimeout) {
 			clearTimeout(this.scrollTimeout);
 		}
