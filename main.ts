@@ -96,7 +96,7 @@ async function fetchAllPages<T>(initialUrl: URL, settings: PluginSettings): Prom
 		}
 		visitedUrls.add(nextUrl);
 
-		const result = await requestUrl({
+		const result: RequestUrlResponse = await requestUrl({
 			url: nextUrl,
 			headers: {
 				'Authorization': 'token ' + settings.paperlessAuthToken
@@ -108,7 +108,7 @@ async function fetchAllPages<T>(initialUrl: URL, settings: PluginSettings): Prom
 			throw new Error('Paperless returned HTTP ' + result.status);
 		}
 
-		const payload = result.json;
+		const payload: Record<string, any> = result.json;
 		if (!payload || !Array.isArray(payload.results) ||
 			!Object.prototype.hasOwnProperty.call(payload, 'next') ||
 			(payload.next !== null && typeof payload.next !== 'string')) {
