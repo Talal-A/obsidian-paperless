@@ -190,31 +190,6 @@ function searchPaperlessUrl(editor: Editor, settings: PluginSettings): Paperless
 	return null;
 }
 
-async function getExistingShareLink(settings: PluginSettings, documentId: string) {
-	const url = new URL(settings.paperlessUrl + '/api/documents/' + documentId + '/share_links/?format=json');
-	let result;
-	try {
-		result = await requestUrl({
-			url: url.toString(),
-			headers: {
-				'Authorization': 'token ' + settings.paperlessAuthToken
-			}
-		})
-		if (result.status != 200) {
-			console.error("An exception occurred in getExistingShareLink. Response: " + result);
-			return null;
-		}
-		for (const item of result.json) {
-			if (item['expiration'] == null)  {
-				return new URL(settings.paperlessUrl + '/share/' + item['slug']);
-			}
-		}
-	} catch (e) {
-		console.error("An exception occurred in getExistingShareLink. Exception: " + e + " and response " + result);
-	}
-
-	return null;
-}
 
 type ShareLinkFileVersion = 'archive' | 'original';
 
@@ -270,6 +245,7 @@ async function createShareLink(settings: PluginSettings, documentId: string, fil
 }
 
 async function findShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion, attempts = 1) {
+	// Sometimes this takes a while, give it five immediate retries before giving up.
 	for (let i = 0; i < attempts; i++) {
 		const link = await getExistingShareLink(settings, documentId, fileVersion);
 		if (link) {
