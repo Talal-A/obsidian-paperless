@@ -218,6 +218,34 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 
 type ShareLinkFileVersion = 'archive' | 'original';
 
+async function getExistingShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion) {
+	const url = new URL(settings.paperlessUrl + '/api/documents/' + documentId + '/share_links/?format=json');
+	let result;
+	try {
+		result = await requestUrl({
+			url: url.toString(),
+			headers: {
+				'Authorization': 'token ' + settings.paperlessAuthToken
+			}
+		})
+		if (result.status != 200) {
+			console.error("An exception occurred in getExistingShareLink. Response: " + result);
+			return null;
+		}
+		for (const item of result.json) {
+			const expiration = item['expiration'];
+			if (item['file_version'] == fileVersion && item['slug'] &&
+				(expiration == null || new Date(expiration).getTime() > Date.now())) {
+				return new URL(settings.paperlessUrl + '/share/' + item['slug']);
+			}
+		}
+	} catch (e) {
+		console.error("An exception occurred in getExistingShareLink. Exception: " + e + " and response " + result);
+	}
+
+	return null;
+}
+
 async function createShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion) {
 	const url = new URL(settings.paperlessUrl + '/api/share_links/');
 	let result;
@@ -231,18 +259,24 @@ async function createShareLink(settings: PluginSettings, documentId: string, fil
 				'Authorization': 'token ' + settings.paperlessAuthToken
 			}
 		})
-		return result.status === 201;
+		if (result.status === 201 && result.json['slug']) {
+			return result.json['slug'];
+		}
 	} catch (e) {
 		console.error("An exception occurred in createShareLink. Exception: " + e + " and response " + result);
-		return false;
 	}
+
+	return null;
 }
 
-async function findShareLink(settings: PluginSettings, documentId: string, attempts = 1) {
+async function findShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion, attempts = 1) {
 	for (let i = 0; i < attempts; i++) {
-		const link = await getExistingShareLink(settings, documentId);
+		const link = await getExistingShareLink(settings, documentId, fileVersion);
 		if (link) {
 			return link;
+		}
+		if (i < attempts - 1) {
+			await new Promise(resolve => setTimeout(resolve, 250));
 		}
 	}
 
@@ -250,47 +284,60 @@ async function findShareLink(settings: PluginSettings, documentId: string, attem
 }
 
 async function createAndFindShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion) {
-	if (await createShareLink(settings, documentId, fileVersion)) {
-		return await findShareLink(settings, documentId, 6);
+	const slug = await createShareLink(settings, documentId, fileVersion);
+	if (slug) {
+		return new URL(settings.paperlessUrl + '/share/' + slug);
 	}
 
-	return null;
+	return await findShareLink(settings, documentId, fileVersion, 6);
 }
 
 async function getShareLink(settings: PluginSettings, documentId: string) {
-	return await findShareLink(settings, documentId)
+	return await findShareLink(settings, documentId, 'archive')
 		?? await createAndFindShareLink(settings, documentId, 'archive')
+		?? await findShareLink(settings, documentId, 'original')
 		?? await createAndFindShareLink(settings, documentId, 'original');
 }
 
+function getDocumentPath(settings: PluginSettings, documentId: string) {
+	const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
+	const filename = 'paperless-' + documentId + '.pdf';
+	return folderPath ? folderPath + '/' + filename : filename;
+}
+
 // Heavily inspired by https://github.com/RyotaUshio/obsidian-pdf-plus/blob/127ea5b94bb8f8fa0d4c66bcd77b3809caa50b21/src/modals/external-pdf-modals.ts#L249
-async function createDocument(app: App, editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData) {
-	// Create the parent folder
-	const folderPath = normalizePath(settings.documentStoragePath);
-	if (folderPath) {
-		const folderRef = app.vault.getAbstractFileByPath(folderPath);
-		const folderExists = !!(folderRef) && folderRef instanceof TFolder;
-		if (!folderExists) {
-			await app.vault.createFolder(folderPath);
+async function createDocument(app: App, editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData): Promise<boolean> {
+	try {
+		// Create the parent folder
+		const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
+		if (folderPath) {
+			const folderRef = app.vault.getAbstractFileByPath(folderPath);
+			const folderExists = !!(folderRef) && folderRef instanceof TFolder;
+			if (!folderExists) {
+				await app.vault.createFolder(folderPath);
+			}
 		}
-	}
 
-	const filename = 'paperless-' + paperlessUrl.documentId + '.pdf';
-	const fileRef = app.vault.getAbstractFileByPath(folderPath + '/' + filename);
-	const fileExists = !!(fileRef) && fileRef instanceof TFile;
-	if (!fileExists) {
-		const shareLink = await getShareLink(settings, paperlessUrl.documentId);
-		if (shareLink) {
-			const response = await requestUrl({
-				url: shareLink.href,
-				method: 'GET'
-			});
-			await app.vault.createBinary(folderPath + '/' + filename, response.arrayBuffer);
+		const filename = 'paperless-' + paperlessUrl.documentId + '.pdf';
+		const documentPath = getDocumentPath(settings, paperlessUrl.documentId);
+		const fileRef = app.vault.getAbstractFileByPath(documentPath);
+		const fileExists = !!(fileRef) && fileRef instanceof TFile;
+		if (!fileExists) {
+			const shareLink = await getShareLink(settings, paperlessUrl.documentId);
+			if (!shareLink) {
+				throw new Error('No usable share link found');
+			}
+			await app.vault.create(documentPath, shareLink.href);
 		}
-	}
 
-	const linkPrefix = settings.embedDocuments ? '![' : '[';
-	editor.replaceRange(linkPrefix + '[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
+		const linkPrefix = settings.embedDocuments ? '![' : '[';
+		editor.replaceRange(linkPrefix + '[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
+		return true;
+	} catch (error) {
+		console.error('Failed to create Paperless document:', error);
+		new Notice('Failed to import Paperless document.');
+		return false;
+	}
 }
 
 async function importMissingDocuments(app: App, editor: Editor, settings: PluginSettings) {
@@ -307,7 +354,8 @@ async function importMissingDocuments(app: App, editor: Editor, settings: Plugin
 		return;
 	}
 
-	const folderPath = normalizePath(settings.documentStoragePath);
+	// Create the parent folder
+	const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
 	if (folderPath) {
 		const folderRef = app.vault.getAbstractFileByPath(folderPath);
 		const folderExists = !!(folderRef) && folderRef instanceof TFolder;
@@ -317,24 +365,27 @@ async function importMissingDocuments(app: App, editor: Editor, settings: Plugin
 	}
 
 	let importedCount = 0;
+	let failedCount = 0;
 	for (const documentId of documentIds) {
-		const filename = 'paperless-' + documentId + '.pdf';
-		const fileRef = app.vault.getAbstractFileByPath(folderPath + '/' + filename);
-		const fileExists = !!(fileRef) && fileRef instanceof TFile;
-		if (!fileExists) {
-			const shareLink = await getShareLink(settings, documentId);
-			if (shareLink) {
-				const response = await requestUrl({
-					url: shareLink.href,
-					method: 'GET'
-				});
-				await app.vault.createBinary(folderPath + '/' + filename, response.arrayBuffer);
+		try {
+			const documentPath = getDocumentPath(settings, documentId);
+			const fileRef = app.vault.getAbstractFileByPath(documentPath);
+			const fileExists = !!(fileRef) && fileRef instanceof TFile;
+			if (!fileExists) {
+				const shareLink = await getShareLink(settings, documentId);
+				if (!shareLink) {
+					throw new Error('No usable share link found');
+				}
+				await app.vault.create(documentPath, shareLink.href);
 				importedCount++;
 			}
+		} catch (error) {
+			failedCount++;
+			console.error('Failed to import Paperless document ' + documentId + ':', error);
 		}
 	}
 
-	new Notice(`Imported ${importedCount} of ${documentIds.size} document(s).`);
+	new Notice(`Imported ${importedCount} of ${documentIds.size} document(s).${failedCount ? ` Failed: ${failedCount}.` : ''}`);
 }
 
 async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: string, tagIds: number[] = []): Promise<string[]> {
@@ -657,8 +708,10 @@ class DocumentSelectorModal extends Modal {
 						to: { line: cursor.line, ch: cursor.ch }
 					}
 				}
-				await createDocument(this.app, this.editor, this.settings, documentInfo);
-				this.close();
+				const created = await createDocument(this.app, this.editor, this.settings, documentInfo);
+				if (created) {
+					this.close();
+				}
 			};
 
 			imgElement.onerror = () => {
