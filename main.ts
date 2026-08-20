@@ -1,10 +1,11 @@
-import { App, Editor, EditorRange, MarkdownView, Modal, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting, setIcon, TFolder, TFile } from 'obsidian';
+import { App, Editor, EditorRange, Modal, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting, TFolder, TFile } from 'obsidian';
 import { escapeRegExp } from 'lodash';
 
 interface PluginSettings {
 	paperlessUrl: string;
 	paperlessAuthToken: string;
 	documentStoragePath: string;
+	embedDocuments: boolean;
 }
 
 interface PaperlessInsertionData {
@@ -15,7 +16,8 @@ interface PaperlessInsertionData {
 const DEFAULT_SETTINGS: PluginSettings = {
 	paperlessUrl: '',
 	paperlessAuthToken: '',
-	documentStoragePath: ''
+	documentStoragePath: '',
+	embedDocuments: true
 }
 
 export default class ObsidianPaperless extends Plugin {
@@ -38,7 +40,7 @@ export default class ObsidianPaperless extends Plugin {
 			editorCallback: (editor: Editor) => {
 				const paperlessUrl = searchPaperlessUrl(editor, this.settings);
 				if (paperlessUrl) {
-					createDocument(editor, this.settings, paperlessUrl);
+					createDocument(this.app, editor, this.settings, paperlessUrl);
 				}
 			}
 		});
@@ -49,6 +51,14 @@ export default class ObsidianPaperless extends Plugin {
 			callback: () => {
 				new Notice('Refreshing paperless cache.');
 				refreshCacheFromPaperless(this.settings, false);
+			}
+		});
+
+		this.addCommand({
+			id: 'import-missing-paperless',
+			name: 'Import missing documents',
+			editorCallback: async (editor: Editor) => {
+				await importMissingDocuments(this.app, editor, this.settings);
 			}
 		});
 
@@ -67,7 +77,54 @@ export default class ObsidianPaperless extends Plugin {
 }
 
 let cachedResult: RequestUrlResponse;
-let tagCache = new Map();
+const tagCache = new Map();
+
+interface PaginatedResponse<T> {
+	response: RequestUrlResponse;
+	results: T[];
+}
+
+async function fetchAllPages<T>(initialUrl: URL, settings: PluginSettings): Promise<PaginatedResponse<T>> {
+	const visitedUrls = new Set<string>();
+	let nextUrl: string | null = initialUrl.toString();
+	let firstResponse: RequestUrlResponse | null = null;
+	const results: T[] = [];
+
+	while (nextUrl !== null) {
+		if (visitedUrls.has(nextUrl)) {
+			throw new Error('Pagination loop detected');
+		}
+		visitedUrls.add(nextUrl);
+
+		const result: RequestUrlResponse = await requestUrl({
+			url: nextUrl,
+			headers: {
+				'Authorization': 'token ' + settings.paperlessAuthToken
+			}
+		});
+		firstResponse ??= result;
+
+		if (result.status < 200 || result.status >= 300) {
+			throw new Error('Paperless returned HTTP ' + result.status);
+		}
+
+		const payload: Record<string, any> = result.json;
+		if (!payload || !Array.isArray(payload.results) ||
+			!Object.prototype.hasOwnProperty.call(payload, 'next') ||
+			(payload.next !== null && typeof payload.next !== 'string')) {
+			throw new Error('Paperless returned an invalid paginated response');
+		}
+
+		results.push(...payload.results);
+		nextUrl = payload.next === null ? null : new URL(payload.next, nextUrl).toString();
+	}
+
+	if (!firstResponse) {
+		throw new Error('Paperless returned no response');
+	}
+
+	return {response: firstResponse, results};
+}
 
 async function testConnection(settings: PluginSettings) {
 	new Notice("Testing connection to " + settings.paperlessUrl)
@@ -85,34 +142,25 @@ async function testConnection(settings: PluginSettings) {
 	} catch(exception) {
 		new Notice("Failed to connect to " + settings.paperlessUrl + " - check the console for additional information.")
 		console.log("Failed connection to " + url + " with error: " + exception)
-	}	
+	}
 }
 
 async function refreshCacheFromPaperless(settings: PluginSettings, silent=true) {
 	const url = new URL(settings.paperlessUrl + '/api/documents/?format=json');
-	const result = await requestUrl({
-		url: url.toString(),
-		headers: {
-			'Authorization': 'token ' + settings.paperlessAuthToken
-		}
-	})
-	cachedResult = result;
+	const documentResult = await fetchAllPages<Record<string, any>>(url, settings);
+	cachedResult = documentResult.response;
+	cachedResult.json['results'] = documentResult.results;
 
 	// Cache data relating to tags
 	const tagUrl = new URL(settings.paperlessUrl + '/api/tags/?format=json');
-	const tagResult = await requestUrl({
-		url: tagUrl.toString(),
-		headers: {
-			"accept": "application/json; version=5",
-			'Authorization': 'token ' + settings.paperlessAuthToken
-		}
-	})
-	for (let i = 0; i < tagResult.json['results'].length; i++) {
-		let current = tagResult.json['results'][i];
+	const tagResult = await fetchAllPages<Record<string, any>>(tagUrl, settings);
+	tagCache.clear();
+	for (let i = 0; i < tagResult.results.length; i++) {
+		const current = tagResult.results[i];
 		tagCache.set(current['id'], current);
 	}
 	if(!silent) {
-		new Notice('Paperless cache refresh completed. Found ' + cachedResult.json['all'].length + ' documents and ' + tagCache.size + ' tags.');
+		new Notice('Paperless cache refresh completed. Found ' + cachedResult.json['results'].length + ' documents and ' + tagCache.size + ' tags.');
 	}
 }
 
@@ -167,11 +215,23 @@ function searchPaperlessUrl(editor: Editor, settings: PluginSettings): Paperless
 		}
 	}
 
+	// also match [[paperless-{id}.pdf]] wiki links
+	const wikiLinkMatch = text.match(/\[\[paperless-(\d+)\.pdf\]\]/);
+	if (wikiLinkMatch) {
+		return {
+			documentId: wikiLinkMatch[1],
+			range: wordRange
+		};
+	}
+
 	// nothing found
 	return null;
 }
 
-async function getExistingShareLink(settings: PluginSettings, documentId: string) {
+
+type ShareLinkFileVersion = 'archive' | 'original';
+
+async function getExistingShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion) {
 	const url = new URL(settings.paperlessUrl + '/api/documents/' + documentId + '/share_links/?format=json');
 	let result;
 	try {
@@ -185,8 +245,11 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 			console.error("An exception occurred in getExistingShareLink. Response: " + result);
 			return null;
 		}
-		for (let item of result.json) {
-			if (item['expiration'] == null)  {
+		const shareLinks = await fetchAllPages<Record<string, any>>(url, settings);
+		for (const item of shareLinks.results) {
+			const expiration = item['expiration'];
+			if (item['file_version'] == fileVersion && item['slug'] &&
+				(expiration == null || new Date(expiration).getTime() > Date.now())) {
 				return new URL(settings.paperlessUrl + '/share/' + item['slug']);
 			}
 		}
@@ -197,7 +260,7 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 	return null;
 }
 
-async function createShareLink(settings: PluginSettings, documentId: string) {
+async function createShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion) {
 	const url = new URL(settings.paperlessUrl + '/api/share_links/');
 	let result;
 	try {
@@ -205,67 +268,145 @@ async function createShareLink(settings: PluginSettings, documentId: string) {
 			url: url.toString(),
 			method: 'POST',
 			contentType: 'application/json',
-			body: '{"document":' + documentId + ',"file_version":"original"}',
+			body: JSON.stringify({ document: documentId, file_version: fileVersion }),
 			headers: {
 				'Authorization': 'token ' + settings.paperlessAuthToken
 			}
 		})
-		if (result.status != 201) {
-			console.error("An exception occurred in createShareLink. Response: " + result);
+		if (result.status === 201 && result.json['slug']) {
+			return result.json['slug'];
 		}
 	} catch (e) {
 		console.error("An exception occurred in createShareLink. Exception: " + e + " and response " + result);
 	}
+
+	return null;
+}
+
+async function findShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion, attempts = 1) {
+	// Sometimes this takes a while, give it five immediate retries before giving up.
+	for (let i = 0; i < attempts; i++) {
+		const link = await getExistingShareLink(settings, documentId, fileVersion);
+		if (link) {
+			return link;
+		}
+		if (i < attempts - 1) {
+			await new Promise(resolve => setTimeout(resolve, 250));
+		}
+	}
+
+	return null;
+}
+
+async function createAndFindShareLink(settings: PluginSettings, documentId: string, fileVersion: ShareLinkFileVersion) {
+	const slug = await createShareLink(settings, documentId, fileVersion);
+	if (slug) {
+		return new URL(settings.paperlessUrl + '/share/' + slug);
+	}
+
+	return await findShareLink(settings, documentId, fileVersion, 6);
 }
 
 async function getShareLink(settings: PluginSettings, documentId: string) {
-	let link = await getExistingShareLink(settings, documentId);
-	if (!link) {
-		createShareLink(settings, documentId);
-		link = await getExistingShareLink(settings, documentId);
-		if (link == null) {
-			// Sometimes this takes a while, give it five immediate retries before giving up.
-			for (let i = 0; i < 5; i++) {
-				link = await getExistingShareLink(settings, documentId);
-				if (link) {
-					break;
-				}
-			}
-		}
-	}
+	return await findShareLink(settings, documentId, 'archive')
+		?? await createAndFindShareLink(settings, documentId, 'archive')
+		?? await findShareLink(settings, documentId, 'original')
+		?? await createAndFindShareLink(settings, documentId, 'original');
+}
 
-	return link;
+function getDocumentPath(settings: PluginSettings, documentId: string) {
+	const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
+	const filename = 'paperless-' + documentId + '.pdf';
+	return folderPath ? folderPath + '/' + filename : filename;
 }
 
 // Heavily inspired by https://github.com/RyotaUshio/obsidian-pdf-plus/blob/127ea5b94bb8f8fa0d4c66bcd77b3809caa50b21/src/modals/external-pdf-modals.ts#L249
-async function createDocument(editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData) {
+async function createDocument(app: App, editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData): Promise<boolean> {
+	try {
+		// Create the parent folder
+		const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
+		if (folderPath) {
+			const folderRef = app.vault.getAbstractFileByPath(folderPath);
+			const folderExists = !!(folderRef) && folderRef instanceof TFolder;
+			if (!folderExists) {
+				await app.vault.createFolder(folderPath);
+			}
+		}
+
+		const filename = 'paperless-' + paperlessUrl.documentId + '.pdf';
+		const documentPath = getDocumentPath(settings, paperlessUrl.documentId);
+		const fileRef = app.vault.getAbstractFileByPath(documentPath);
+		const fileExists = !!(fileRef) && fileRef instanceof TFile;
+		if (!fileExists) {
+			const shareLink = await getShareLink(settings, paperlessUrl.documentId);
+			if (!shareLink) {
+				throw new Error('No usable share link found');
+			}
+			await app.vault.create(documentPath, shareLink.href);
+		}
+
+		const linkPrefix = settings.embedDocuments ? '![' : '[';
+		editor.replaceRange(linkPrefix + '[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
+		return true;
+	} catch (error) {
+		console.error('Failed to create Paperless document:', error);
+		new Notice('Failed to import Paperless document.');
+		return false;
+	}
+}
+
+async function importMissingDocuments(app: App, editor: Editor, settings: PluginSettings) {
+	const content = editor.getValue();
+	const pattern = /!?\[\[paperless-(\d+)\.pdf\]\]/g;
+	const documentIds = new Set<string>();
+	let match;
+	while ((match = pattern.exec(content)) !== null) {
+		documentIds.add(match[1]);
+	}
+
+	if (documentIds.size === 0) {
+		new Notice('No paperless document links found in this note.');
+		return;
+	}
+
 	// Create the parent folder
-	const folderPath = normalizePath(settings.documentStoragePath);
+	const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
 	if (folderPath) {
-		const folderRef = this.app.vault.getAbstractFileByPath(folderPath);
+		const folderRef = app.vault.getAbstractFileByPath(folderPath);
 		const folderExists = !!(folderRef) && folderRef instanceof TFolder;
 		if (!folderExists) {
-			await this.app.vault.createFolder(folderPath);
-		}
-	}
-	
-	const filename = 'paperless-' + paperlessUrl.documentId + '.pdf';
-	const fileRef = this.app.vault.getAbstractFileByPath(folderPath + '/' + filename); 
-	const fileExists = !!(fileRef) && fileRef instanceof TFile;
-	if (!fileExists) {
-		const shareLink = await getShareLink(settings, paperlessUrl.documentId);
-		if (shareLink) {
-			await this.app.vault.create(folderPath + '/' + filename, shareLink.href);
+			await app.vault.createFolder(folderPath);
 		}
 	}
 
-	editor.replaceRange('![[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
+	let importedCount = 0;
+	let failedCount = 0;
+	for (const documentId of documentIds) {
+		try {
+			const documentPath = getDocumentPath(settings, documentId);
+			const fileRef = app.vault.getAbstractFileByPath(documentPath);
+			const fileExists = !!(fileRef) && fileRef instanceof TFile;
+			if (!fileExists) {
+				const shareLink = await getShareLink(settings, documentId);
+				if (!shareLink) {
+					throw new Error('No usable share link found');
+				}
+				await app.vault.create(documentPath, shareLink.href);
+				importedCount++;
+			}
+		} catch (error) {
+			failedCount++;
+			console.error('Failed to import Paperless document ' + documentId + ':', error);
+		}
+	}
+
+	new Notice(`Imported ${importedCount} of ${documentIds.size} document(s).${failedCount ? ` Failed: ${failedCount}.` : ''}`);
 }
 
 async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: string, tagIds: number[] = []): Promise<string[]> {
 	let urlStr = settings.paperlessUrl + '/api/documents/?format=json';
 	if (searchQuery) {
-		urlStr += '&title_content=' + encodeURIComponent(searchQuery);
+		urlStr += '&text=' + encodeURIComponent(searchQuery);
 	}
 	if (tagIds.length > 0) {
 		urlStr += '&tags__id__all=' + tagIds.join(',');
@@ -273,17 +414,8 @@ async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: s
 	console.log("Querying " + urlStr)
 	const url = new URL(urlStr);
 	try {
-		const result = await requestUrl({
-			url: url.toString(),
-			headers: {
-				'Authorization': 'token ' + settings.paperlessAuthToken
-			}
-		});
-		if (result.status === 200 && result.json['all']) {
-			return result.json['all'];
-		}
-		console.error('Search returned unexpected response:', result);
-		return [];
+		const result = await fetchAllPages<Record<string, any>>(url, settings);
+		return result.results.map((d: Record<string, any>) => d.id.toString());
 	} catch (error) {
 		console.error('Error searching Paperless:', error);
 		throw error;
@@ -300,6 +432,7 @@ class DocumentSelectorModal extends Modal {
 	isLoading: boolean;
 	scrollTimeout: number | null;
 	searchTimeout: number | null;
+	searchGeneration: number;
 	selectedTags: Set<number>;
 	availableDocumentIds: string[];
 
@@ -314,6 +447,7 @@ class DocumentSelectorModal extends Modal {
 		this.isLoading = false;
 		this.scrollTimeout = null;
 		this.searchTimeout = null;
+		this.searchGeneration = 0;
 		this.selectedTags = new Set();
 		this.availableDocumentIds = [];
 	}
@@ -325,9 +459,9 @@ class DocumentSelectorModal extends Modal {
 			headers: {
 				'Authorization': 'token ' + this.settings.paperlessAuthToken
 			}
-		})	
+		})
 		imgElement.src = URL.createObjectURL(new Blob([result.arrayBuffer]));
-	};
+	}
 
 	async displayTags(tagDiv: HTMLDivElement, documentId: string) {
 		const thumbUrl = this.settings.paperlessUrl + '/api/documents/' + documentId + '/';
@@ -340,12 +474,15 @@ class DocumentSelectorModal extends Modal {
 		const tags = result.json['tags']
 		for (let x = 0; x < tags.length; x++) {
 			const currentTag = tagDiv.createDiv();
-			const tagData = tagCache.get(tags[x]);					
+			const tagData = tagCache.get(tags[x]);
+			if (!tagData) {
+				continue;
+			}
 			const tagStr = currentTag.createEl('span', {text: tagData['name']});
 			tagStr.setCssStyles({color: tagData['text_color'], fontSize: '0.7em'});
 			currentTag.setCssStyles({background: tagData['color'], borderRadius: '8px', padding: '2px', marginTop: '1px', marginRight: '5px'})
 		}
-	};
+	}
 
 	async onOpen() {
 		const {contentEl} = this;
@@ -446,7 +583,7 @@ class DocumentSelectorModal extends Modal {
 		};
 
 		const totalWidth = contentEl.innerWidth;
-		this.availableDocumentIds = cachedResult.json['all'].sort((a:String, b:String) => {return +a - +b}).reverse();
+		this.availableDocumentIds = cachedResult.json['results'].map((d: Record<string, any>) => d.id.toString()).sort((a:string, b:string) => {return +a - +b}).reverse();
 		const totalAssets = this.availableDocumentIds.length;
 
 		// Create scroll container
@@ -467,46 +604,52 @@ class DocumentSelectorModal extends Modal {
 		loadingDiv.style.display = 'none';
 
 		searchInput.addEventListener('input', async (e) => {
+			const requestId = ++this.searchGeneration;
 			if (this.searchTimeout) {
 				clearTimeout(this.searchTimeout);
 			}
 
 			// Debounce: wait 500ms after user stops typing
 			this.searchTimeout = window.setTimeout(async () => {
+				if (requestId !== this.searchGeneration) return;
 				const searchQuery = (e.target as HTMLInputElement).value.trim();
-				
+
 			if (searchQuery === '' && this.selectedTags.size === 0) {
 				// Reset to cached results
-				this.availableDocumentIds = cachedResult.json['all'].sort((a:String, b:String) => {return +a - +b}).reverse();
+				this.availableDocumentIds = cachedResult.json['results'].map((d: Record<string, any>) => d.id.toString()).sort((a:string, b:string) => {return +a - +b}).reverse();
 			} else {
 				// Perform search
 				searchInput.disabled = true;
 				loadingDiv.setText('Searching...');
 				loadingDiv.style.display = 'block';
-				
+
 				try {
 					const tagIds = Array.from(this.selectedTags);
 					const searchResults = await searchPaperlessDocuments(this.settings, searchQuery, tagIds);
-					this.availableDocumentIds = searchResults.sort((a:String, b:String) => {return +a - +b}).reverse();
+					if (requestId !== this.searchGeneration) return;
+					this.availableDocumentIds = searchResults.sort((a:string, b:string) => {return +a - +b}).reverse();
 				} catch (error) {
+					if (requestId !== this.searchGeneration) return;
 					new Notice('Failed to search documents');
 					console.error('Search failed:', error);
 					loadingDiv.style.display = 'none';
 				} finally {
-					searchInput.disabled = false;
-					loadingDiv.style.display = 'none';
+					if (requestId === this.searchGeneration) {
+						searchInput.disabled = false;
+						loadingDiv.style.display = 'none';
+					}
 				}
 			}				// Reset and reload modal content
 				this.currentPage = 0;
 				this.loadedAssets.clear();
 				left.empty();
 				right.empty();
-				
+
 				// Scroll to top
 				if (this.scrollContainer) {
 					this.scrollContainer.scrollTop = 0;
 				}
-				
+
 			// Initial load: load more items to ensure scrollbar appears on large screens
 			const initialBatchSize = Math.max(this.batchSize * 3, 20);
 			this.loadBatch(left, right, totalWidth, this.availableDocumentIds, 0, Math.min(initialBatchSize, this.availableDocumentIds.length), loadingDiv);
@@ -566,30 +709,32 @@ class DocumentSelectorModal extends Modal {
 			const overallDiv = targetColumn.createDiv({cls: 'obsidian-paperless-overallDiv'});
 			const imageDiv = overallDiv.createDiv({cls: 'obsidian-paperless-imageDiv'});
 			const tagDiv = overallDiv.createDiv({cls: 'obsidian-paperless-tagDiv'});
-			
+
 			this.displayTags(tagDiv, documentId);
-			
+
 			const imgElement = imageDiv.createEl('img');
 			imgElement.width = (totalWidth / 2) - 5;
 			imgElement.style.cursor = 'pointer';
-			
-			imgElement.onclick = () => {
+
+			imgElement.onclick = async () => {
 				const cursor = this.editor.getCursor();
 				const documentInfo: PaperlessInsertionData = {
 					documentId: documentId,
-					range: { 
+					range: {
 						from: { line: cursor.line, ch: cursor.ch },
 						to: { line: cursor.line, ch: cursor.ch }
 					}
 				}
-				createDocument(this.editor, this.settings, documentInfo);
-				overallDiv.setCssStyles({opacity: '0.5'});
+				const created = await createDocument(this.app, this.editor, this.settings, documentInfo);
+				if (created) {
+					this.close();
+				}
 			};
-			
+
 			imgElement.onerror = () => {
 				overallDiv.setText('Failed to load');
 			};
-			
+
 			this.displayThumbnail(imgElement, documentId);
 			this.loadedAssets.set(i, overallDiv);
 		}
@@ -605,6 +750,9 @@ class DocumentSelectorModal extends Modal {
 	}
 
 	onClose() {
+		this.isLoading = false;
+		this.scrollContainer = null;
+		this.searchGeneration++;
 		if (this.scrollTimeout) {
 			clearTimeout(this.scrollTimeout);
 		}
@@ -655,6 +803,15 @@ class SettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.documentStoragePath)
 				.onChange(async (value) => {
 					this.plugin.settings.documentStoragePath = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName('Embed documents')
+			.setDesc('When enabled, new documents are inserted as embedded PDFs (![[...]]). Otherwise as links ([[...]]).')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.embedDocuments)
+				.onChange(async (value) => {
+					this.plugin.settings.embedDocuments = value;
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
