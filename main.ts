@@ -154,6 +154,7 @@ async function refreshCacheFromPaperless(settings: PluginSettings, silent=true) 
 	// Cache data relating to tags
 	const tagUrl = new URL(settings.paperlessUrl + '/api/tags/?format=json');
 	const tagResult = await fetchAllPages<Record<string, any>>(tagUrl, settings);
+	tagCache.clear();
 	for (let i = 0; i < tagResult.results.length; i++) {
 		const current = tagResult.results[i];
 		tagCache.set(current['id'], current);
@@ -749,6 +750,8 @@ class DocumentSelectorModal extends Modal {
 	}
 
 	onClose() {
+		this.isLoading = false;
+		this.scrollContainer = null;
 		this.searchGeneration++;
 		if (this.scrollTimeout) {
 			clearTimeout(this.scrollTimeout);
