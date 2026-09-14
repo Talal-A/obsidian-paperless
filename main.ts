@@ -12,6 +12,13 @@ interface PaperlessInsertionData {
 	range: EditorRange;
 }
 
+type FileVersion = 'archive' | 'original';
+
+// Which file version a fresh share link should point at.
+// 'archive' is the paperless-ngx default and always yields a PDF that
+// Obsidian/PDF++ can render; 'original' keeps upstream's old behaviour.
+const DEFAULT_SHARE_FILE_VERSION: FileVersion = 'archive';
+
 const DEFAULT_SETTINGS: PluginSettings = {
 	paperlessUrl: '',
 	paperlessAuthToken: '',
@@ -38,7 +45,7 @@ export default class ObsidianPaperless extends Plugin {
 			editorCallback: (editor: Editor) => {
 				const paperlessUrl = searchPaperlessUrl(editor, this.settings);
 				if (paperlessUrl) {
-					createDocument(editor, this.settings, paperlessUrl);
+					createDocument(this.app, editor, this.settings, paperlessUrl);
 				}
 			}
 		});
@@ -48,7 +55,12 @@ export default class ObsidianPaperless extends Plugin {
 			name: 'Refresh document cache',
 			callback: () => {
 				new Notice('Refreshing paperless cache.');
-				refreshCacheFromPaperless(this.settings, false);
+				// a refresh that cannot reach paperless becomes an unhandled
+				// promise rejection and the user sees only "Refreshing...".
+				refreshCacheFromPaperless(this.settings, false).catch((error) => {
+					new Notice('Failed to refresh cache: ' + (error && error.message ? error.message : error));
+					console.error('Paperless refresh failed:', error);
+				});
 			}
 		});
 
@@ -66,8 +78,99 @@ export default class ObsidianPaperless extends Plugin {
 	}
 }
 
-let cachedResult: RequestUrlResponse;
 let tagCache = new Map();
+
+// Ids of every cached document, in the order paperless returned them.
+let cachedDocumentIds: string[] = [];
+
+// True once documents have been fetched successfully, so opening the modal does
+// not re-request them every time. A failed load leaves this false and is retried.
+let cacheLoaded = false;
+
+// Non-fatal problems from the last cache refresh, surfaced in the notice.
+let refreshWarnings: string[] = [];
+
+// paperless-ngx defaults to 25 results per page; ask for full pages instead.
+const PAGE_SIZE = '100';
+// Safety stop so a misbehaving "next" chain cannot loop forever.
+const MAX_PAGES = 50;
+
+// PDF++ only treats a note as an external pdf ("dummy pdf file") when the file
+// holds a single URL and stays within this size, so a .pdf extension is only
+// safe to use when the share link we write fits.
+// See https://ryotaushio.github.io/obsidian-pdf-plus/external-pdf-files.html
+const DUMMY_FILE_MAX_BYTES = 300;
+
+/// Request headers for the paperless API.
+function authHeaders(settings: PluginSettings, headers: Record<string, string> = {}): Record<string, string> {
+	return Object.assign({'Authorization': 'token ' + settings.paperlessAuthToken}, headers);
+}
+
+/// Build the URL for a given page, keeping every other query parameter.
+/// Pages are derived from the URL we were configured with instead of the
+/// server's "next" link: behind a reverse proxy paperless can build "next" from
+/// a host that is only reachable inside the docker network, which the plugin
+/// cannot connect to (ERR_CONNECTION_REFUSED), and it can also downgrade https
+/// to http. Deriving the page URL ourselves keeps every request on the
+/// configured address.
+function pageUrl(url: string, page: number): string {
+	const u = new URL(url);
+	u.searchParams.set('page', String(page));
+	return u.toString();
+}
+
+/// Items from a paginated response: "results" (api version >= 10) or the legacy
+/// "all" id list on older instances.
+function extractItems(body: any): any[] {
+	if (!body) {
+		return [];
+	}
+	if (Array.isArray(body['results'])) {
+		return body['results'];
+	}
+	if (Array.isArray(body['all'])) {
+		return body['all'];
+	}
+	return [];
+}
+
+/// Fetch every item of a paginated paperless endpoint. Stops when the reported
+/// count is reached, so nothing is silently capped at the default 25 per page.
+async function fetchAllResults(settings: PluginSettings, url: string, headers: Record<string, string> = {}, what = 'results'): Promise<any[]> {
+	const first: RequestUrlResponse = await requestUrl({url: url, headers: authHeaders(settings, headers)});
+	if (first.status != 200) {
+		throw new Error('paperless returned status ' + first.status + ' for ' + url);
+	}
+
+	const body: any = first.json;
+	if (Array.isArray(body)) {
+		// Unpaginated endpoint
+		return body.slice();
+	}
+
+	let items = extractItems(body);
+	const count = typeof body['count'] === 'number' ? body['count'] : items.length;
+
+	for (let page = 2; items.length < count && page <= MAX_PAGES; page++) {
+		const result: RequestUrlResponse = await requestUrl({url: pageUrl(url, page), headers: authHeaders(settings, headers)});
+		if (result.status != 200) {
+			throw new Error('paperless returned status ' + result.status + ' for page ' + page + ' of ' + what);
+		}
+		const more = extractItems(result.json);
+		if (more.length === 0) {
+			break;
+		}
+		items = items.concat(more);
+	}
+
+	return items;
+}
+
+/// Newest first, matching upstream's ordering. Defensive about its input so an
+/// empty or partially populated cache can never throw.
+function sortDocumentIds(ids: string[] | null | undefined): string[] {
+	return (ids || []).slice().sort((a, b) => {return +a - +b}).reverse();
+}
 
 async function testConnection(settings: PluginSettings) {
 	new Notice("Testing connection to " + settings.paperlessUrl)
@@ -89,30 +192,40 @@ async function testConnection(settings: PluginSettings) {
 }
 
 async function refreshCacheFromPaperless(settings: PluginSettings, silent=true) {
-	const url = new URL(settings.paperlessUrl + '/api/documents/?format=json');
-	const result = await requestUrl({
-		url: url.toString(),
-		headers: {
-			'Authorization': 'token ' + settings.paperlessAuthToken
-		}
-	})
-	cachedResult = result;
+	refreshWarnings = [];
+	// Documents: paginated since paperless-ngx 0.x. Fetch every page and read
+	// ids from "results" (api version >= 10) or the legacy "all" id list.
+	const docUrl = settings.paperlessUrl + '/api/documents/?format=json&page_size=' + PAGE_SIZE;
+	const documents = await fetchAllResults(settings, docUrl, {}, 'documents');
+	// raw response afterwards
+	cachedDocumentIds = documents.map((d) => String(typeof d === 'object' && d ? d['id'] : d));
+	cacheLoaded = true;
 
-	// Cache data relating to tags
-	const tagUrl = new URL(settings.paperlessUrl + '/api/tags/?format=json');
-	const tagResult = await requestUrl({
-		url: tagUrl.toString(),
-		headers: {
-			"accept": "application/json; version=5",
-			'Authorization': 'token ' + settings.paperlessAuthToken
+	// Cache data relating to tags. No "version" is pinned here: pinning a fixed
+	// version breaks the request on newer paperless builds, whose allowed
+	// versions moved past the pinned one (issue #33), while omitting the header
+	// lets DRF fall back to the instance default, which works on old and new.
+	// A failure here must not report the whole refresh as failed: documents are
+	// already cached, and tag filtering is a secondary feature. Keep whatever
+	// tags were cached before rather than clearing them.
+	const tagUrl = settings.paperlessUrl + '/api/tags/?format=json&page_size=' + PAGE_SIZE;
+	try {
+		const tags = await fetchAllResults(settings, tagUrl, {}, 'tags');
+		if (tags.length > 0) {
+			tagCache.clear();
+			for (let current of tags) {
+				if (current && current['id'] !== undefined) {
+					tagCache.set(current['id'], current);
+				}
+			}
 		}
-	})
-	for (let i = 0; i < tagResult.json['results'].length; i++) {
-		let current = tagResult.json['results'][i];
-		tagCache.set(current['id'], current);
+	} catch (error) {
+		console.error('Paperless: fetching tags failed, keeping any cached tags:', error);
+		refreshWarnings.push('tags could not be loaded (' + (error && error.message ? error.message : error) + ')');
 	}
 	if(!silent) {
-		new Notice('Paperless cache refresh completed. Found ' + cachedResult.json['all'].length + ' documents and ' + tagCache.size + ' tags.');
+		const suffix = refreshWarnings.length > 0 ? ' (' + refreshWarnings.join('; ') + ')' : '';
+		new Notice('Paperless cache refresh completed. Found ' + cachedDocumentIds.length + ' documents and ' + tagCache.size + ' tags.' + suffix);
 	}
 }
 
@@ -171,7 +284,102 @@ function searchPaperlessUrl(editor: Editor, settings: PluginSettings): Paperless
 	return null;
 }
 
-async function getExistingShareLink(settings: PluginSettings, documentId: string) {
+function fileVersionLabel(version: FileVersion): string {
+	return version === 'archive' ? 'archived PDF' : 'original file';
+}
+
+interface VersionChoice {
+	version: FileVersion;
+	hasArchive: boolean;
+	originalName: string | null;
+	archivedName: string | null;
+}
+
+/// Look up a document's metadata. Returns null if it cannot be read.
+async function fetchDocumentInfo(settings: PluginSettings, documentId: string): Promise<any | null> {
+	const url = new URL(settings.paperlessUrl + '/api/documents/' + documentId + '/?format=json');
+	try {
+		const result = await requestUrl({
+			url: url.toString(),
+			headers: {
+				'Authorization': 'token ' + settings.paperlessAuthToken
+			}
+		})
+		if (result.status != 200) {
+			console.error("An exception occurred in fetchDocumentInfo. Response: " + result);
+			return null;
+		}
+		return result.json;
+	} catch (e) {
+		console.error("An exception occurred in fetchDocumentInfo. Exception: " + e);
+		return null;
+	}
+}
+
+/// Decide which file version should be used for a document.
+/// Prefers the archived version, which paperless-ngx always stores as a pdf, so
+/// documents whose original is not a pdf (docx, odt, images, ...) can still be
+/// displayed by Obsidian. Falls back to the original file when there is no
+/// archive to use.
+async function resolveFileVersion(settings: PluginSettings, documentId: string): Promise<VersionChoice> {
+	const doc = await fetchDocumentInfo(settings, documentId);
+	if (doc === null) {
+		// Metadata unreadable (permission, transient error, very old instance).
+		// Trust the paperless default rather than forcing "original".
+		return {version: DEFAULT_SHARE_FILE_VERSION, hasArchive: false, originalName: null, archivedName: null};
+	}
+
+	const originalName: string | null = doc['original_file_name'] || null;
+	const archivedName: string | null = doc['archived_file_name'] || null;
+
+	if (archivedName && (!originalName || archivedName != originalName)) {
+		// A separate archived version exists, i.e. the original is not a pdf.
+		return {version: 'archive', hasArchive: true, originalName, archivedName};
+	}
+
+	return {version: 'original', hasArchive: !!archivedName, originalName, archivedName};
+}
+
+/// Find the share link we previously created for this document version.
+/// file_version is part of the share link API since paperless-ngx 2.0; on older
+/// instances the field is absent and can only be matched loosely.
+function shareLinkItems(json: any): any[] {
+	if (Array.isArray(json)) {
+		return json;
+	}
+	if (json && Array.isArray(json['results'])) {
+		return json['results'];
+	}
+	return [];
+}
+
+function findExistingLink(json: any, version: FileVersion) {
+	const items = shareLinkItems(json);
+
+	for (let item of items) {
+		if (item['expiration'] == null && item['file_version'] === version) {
+			return item;
+		}
+	}
+
+	// Instances predating the file_version field served share links from the
+	// original file, so such a link is only a valid match for that version.
+	if (version === 'original') {
+		for (let item of items) {
+			if (item['expiration'] == null && item['file_version'] === undefined) {
+				return item;
+			}
+		}
+	}
+
+	return null;
+}
+
+function makeShareUrl(settings: PluginSettings, slug: string): URL {
+	return new URL(settings.paperlessUrl + '/share/' + slug);
+}
+
+async function getExistingShareLink(settings: PluginSettings, documentId: string, fileVersion: FileVersion = DEFAULT_SHARE_FILE_VERSION): Promise<{url: URL, fileVersion: FileVersion} | null> {
 	const url = new URL(settings.paperlessUrl + '/api/documents/' + documentId + '/share_links/?format=json');
 	let result;
 	try {
@@ -185,10 +393,9 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 			console.error("An exception occurred in getExistingShareLink. Response: " + result);
 			return null;
 		}
-		for (let item of result.json) {
-			if (item['expiration'] == null)  {
-				return new URL(settings.paperlessUrl + '/share/' + item['slug']);
-			}
+		let item = findExistingLink(result.json, fileVersion);
+		if (item) {
+			return {url: makeShareUrl(settings, item['slug']), fileVersion: fileVersion};
 		}
 	} catch (e) {
 		console.error("An exception occurred in getExistingShareLink. Exception: " + e + " and response " + result);
@@ -197,7 +404,7 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 	return null;
 }
 
-async function createShareLink(settings: PluginSettings, documentId: string) {
+async function createShareLink(settings: PluginSettings, documentId: string, fileVersion: FileVersion = DEFAULT_SHARE_FILE_VERSION) {
 	const url = new URL(settings.paperlessUrl + '/api/share_links/');
 	let result;
 	try {
@@ -205,7 +412,7 @@ async function createShareLink(settings: PluginSettings, documentId: string) {
 			url: url.toString(),
 			method: 'POST',
 			contentType: 'application/json',
-			body: '{"document":' + documentId + ',"file_version":"original"}',
+			body: '{"document":' + documentId + ',"file_version":"' + fileVersion + '"}',
 			headers: {
 				'Authorization': 'token ' + settings.paperlessAuthToken
 			}
@@ -218,15 +425,15 @@ async function createShareLink(settings: PluginSettings, documentId: string) {
 	}
 }
 
-async function getShareLink(settings: PluginSettings, documentId: string) {
-	let link = await getExistingShareLink(settings, documentId);
+async function getShareLink(settings: PluginSettings, documentId: string, fileVersion: FileVersion = DEFAULT_SHARE_FILE_VERSION) {
+	let link = await getExistingShareLink(settings, documentId, fileVersion);
 	if (!link) {
-		createShareLink(settings, documentId);
-		link = await getExistingShareLink(settings, documentId);
+		createShareLink(settings, documentId, fileVersion);
+		link = await getExistingShareLink(settings, documentId, fileVersion);
 		if (link == null) {
 			// Sometimes this takes a while, give it five immediate retries before giving up.
 			for (let i = 0; i < 5; i++) {
-				link = await getExistingShareLink(settings, documentId);
+				link = await getExistingShareLink(settings, documentId, fileVersion);
 				if (link) {
 					break;
 				}
@@ -237,33 +444,105 @@ async function getShareLink(settings: PluginSettings, documentId: string) {
 	return link;
 }
 
+/// Resolve a share link that Obsidian can actually display: prefer the archived
+/// pdf version and fall back to the original file only when the archive cannot
+/// be used.
+async function resolveShareLink(settings: PluginSettings, documentId: string) {
+	const choice = await resolveFileVersion(settings, documentId);
+	const fallback: FileVersion = choice.version === 'archive' ? 'original' : 'archive';
+
+	let link = await getShareLink(settings, documentId, choice.version);
+	if (!link) {
+		console.log("Paperless: falling back to the " + fileVersionLabel(fallback) + " for document " + documentId);
+		link = await getShareLink(settings, documentId, fallback);
+	}
+
+	if (!link) {
+		return null;
+	}
+
+	// Decide the extension from what the link will actually serve. "An archive
+	// exists" is NOT the same question as "a pdf will be served": a document that
+	// was uploaded as a pdf often has no separate archived version at all
+	// (paperless skips archiving when the original is already pdf/a), and in that
+	// case the original *is* a pdf. Getting this wrong names a pdf-backed note
+	// .share.md, and a .md note holding a URL is not a PDF++ dummy file, so
+	// Obsidian just shows a link that opens in the browser.
+	const servedVersion: FileVersion = link.fileVersion;
+	const originalName: string | null = choice.originalName;
+	const servesArchive = servedVersion === 'archive';
+	const originalIsPdf = /\.pdf$/i.test(originalName || '');
+	const servesPdf = servesArchive || originalIsPdf;
+
+	// PDF++ treats a note as an external pdf only when the file holds a single
+	// URL within DUMMY_FILE_MAX_BYTES, so the .pdf name is only safe to use when
+	// the payload we are about to write actually qualifies.
+	const payload = link.url.href;
+	const withinPdfPlusLimit = payload.length <= DUMMY_FILE_MAX_BYTES;
+
+	return {
+		url: link.url,
+		version: servedVersion,
+		servesPdf: servesPdf,
+		usePdfName: servesPdf && withinPdfPlusLimit,
+		payloadLength: payload.length,
+	};
+}
+
 // Heavily inspired by https://github.com/RyotaUshio/obsidian-pdf-plus/blob/127ea5b94bb8f8fa0d4c66bcd77b3809caa50b21/src/modals/external-pdf-modals.ts#L249
-async function createDocument(editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData) {
+async function createDocument(app: App, editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData) {
+	// not a method, so every insert threw before creating anything)
+
 	// Create the parent folder
 	const folderPath = normalizePath(settings.documentStoragePath);
 	if (folderPath) {
-		const folderRef = this.app.vault.getAbstractFileByPath(folderPath);
+		const folderRef = app.vault.getAbstractFileByPath(folderPath);
 		const folderExists = !!(folderRef) && folderRef instanceof TFolder;
 		if (!folderExists) {
-			await this.app.vault.createFolder(folderPath);
+			await app.vault.createFolder(folderPath);
 		}
 	}
-	
-	const filename = 'paperless-' + paperlessUrl.documentId + '.pdf';
-	const fileRef = this.app.vault.getAbstractFileByPath(folderPath + '/' + filename); 
+
+	// Prefer the archived pdf version so that documents whose original is not a
+	// pdf (docx, odt, images, ...) are still viewable in Obsidian.
+	const link = await resolveShareLink(settings, paperlessUrl.documentId);
+	if (!link) {
+		new Notice('Paperless: could not create a share link for document ' + paperlessUrl.documentId + '.');
+		return;
+	}
+
+	// Name the note so Obsidian/PDF++ actually render it: the stock
+	// paperless-<id>.pdf name whenever a pdf is served (which PDF++) treats as an
+	// external pdf, and paperless-<id>.share.md only when no viewable pdf is
+	// available at all.
+	const filename = 'paperless-' + paperlessUrl.documentId + (link.usePdfName ? '.pdf' : '.share.md');
+
+	// A note with a .pdf name is only rendered inline by PDF++ when its content
+	// is a single URL within PDF++'s size limit and a pdf is really there. If
+	// that is not the case, be explicit rather than silently writing a file that
+	// Obsidian will just show as text.
+	if (!link.usePdfName) {
+		if (!link.servesPdf) {
+			console.log('Paperless: document ' + paperlessUrl.documentId + ' has no pdf version; linking the original file instead.');
+		} else {
+			console.warn('Paperless: the share link for document ' + paperlessUrl.documentId + ' is ' + link.payloadLength +
+				' bytes, over PDF++\'s ' + DUMMY_FILE_MAX_BYTES + ' byte dummy-file limit, so it cannot be embedded as an external pdf.');
+			new Notice('Paperless: the share link for this document is too long for PDF++ to embed as an external PDF. ' +
+				'Shorten the document path or share link if you need inline rendering.');
+		}
+	}
+
+	const fileRef = app.vault.getAbstractFileByPath(folderPath + '/' + filename);
 	const fileExists = !!(fileRef) && fileRef instanceof TFile;
 	if (!fileExists) {
-		const shareLink = await getShareLink(settings, paperlessUrl.documentId);
-		if (shareLink) {
-			await this.app.vault.create(folderPath + '/' + filename, shareLink.href);
-		}
+		await app.vault.create(folderPath + '/' + filename, link.url.href);
 	}
 
 	editor.replaceRange('![[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
 }
 
 async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: string, tagIds: number[] = []): Promise<string[]> {
-	let urlStr = settings.paperlessUrl + '/api/documents/?format=json';
+	let urlStr = settings.paperlessUrl + '/api/documents/?format=json&page_size=' + PAGE_SIZE;
 	if (searchQuery) {
 		urlStr += '&title_content=' + encodeURIComponent(searchQuery);
 	}
@@ -273,17 +552,10 @@ async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: s
 	console.log("Querying " + urlStr)
 	const url = new URL(urlStr);
 	try {
-		const result = await requestUrl({
-			url: url.toString(),
-			headers: {
-				'Authorization': 'token ' + settings.paperlessAuthToken
-			}
-		});
-		if (result.status === 200 && result.json['all']) {
-			return result.json['all'];
-		}
-		console.error('Search returned unexpected response:', result);
-		return [];
+		// Newer paperless no longer returns the legacy "all" id list, so the old
+		// `result.json['all']` lookup returned undefined.
+		const documents = await fetchAllResults(settings, url.toString(), {}, 'search results');
+		return documents.map((d) => String(typeof d === 'object' && d ? d['id'] : d));
 	} catch (error) {
 		console.error('Error searching Paperless:', error);
 		throw error;
@@ -302,6 +574,7 @@ class DocumentSelectorModal extends Modal {
 	searchTimeout: number | null;
 	selectedTags: Set<number>;
 	availableDocumentIds: string[];
+	closeDropdownHandler: ((e: Event) => void) | null;
 
 	constructor(app: App, editor: Editor, settings: PluginSettings) {
 		super(app);
@@ -316,6 +589,7 @@ class DocumentSelectorModal extends Modal {
 		this.searchTimeout = null;
 		this.selectedTags = new Set();
 		this.availableDocumentIds = [];
+		this.closeDropdownHandler = null;
 	}
 
 	async displayThumbnail(imgElement: HTMLImageElement, documentId: string) {
@@ -338,9 +612,13 @@ class DocumentSelectorModal extends Modal {
 			}
 		})
 		const tags = result.json['tags']
-		for (let x = 0; x < tags.length; x++) {
+		// instead of crashing on undefined (issue #30)
+		for (let x = 0; x < (tags || []).length; x++) {
+			const tagData = tagCache.get(tags[x]);
+			if (!tagData) {
+				continue;
+			}
 			const currentTag = tagDiv.createDiv();
-			const tagData = tagCache.get(tags[x]);					
 			const tagStr = currentTag.createEl('span', {text: tagData['name']});
 			tagStr.setCssStyles({color: tagData['text_color'], fontSize: '0.7em'});
 			currentTag.setCssStyles({background: tagData['color'], borderRadius: '8px', padding: '2px', marginTop: '1px', marginRight: '5px'})
@@ -350,8 +628,16 @@ class DocumentSelectorModal extends Modal {
 	async onOpen() {
 		const {contentEl} = this;
 
-		if (cachedResult == null) {
-			await refreshCacheFromPaperless(this.settings);
+		// empty result as failure so a partial cache is still usable
+		if (!cacheLoaded) {
+			try {
+				await refreshCacheFromPaperless(this.settings);
+			} catch (error) {
+				console.error('Paperless: initial cache load failed:', error);
+				new Notice('Paperless: could not load documents. ' +
+					(error && error.message ? error.message : error) +
+					' Use the refresh button to retry.');
+			}
 		}
 
 		// Create header with title and refresh button
@@ -378,7 +664,9 @@ class DocumentSelectorModal extends Modal {
 		const tagDropdown = tagFilterContainer.createDiv({cls: 'obsidian-paperless-tag-dropdown'});
 
 		// Populate tag dropdown
-		const tags = Array.from(tagCache.entries()).sort((a, b) => a[1]['name'].localeCompare(b[1]['name']));
+		const tags = Array.from(tagCache.entries())
+			.filter(([, tagData]) => !!tagData && typeof tagData['name'] === 'string')
+			.sort((a, b) => a[1]['name'].localeCompare(b[1]['name']));
 		for (const [tagId, tagData] of tags) {
 			const tagItem = tagDropdown.createDiv({cls: 'obsidian-paperless-tag-item'});
 
@@ -414,16 +702,33 @@ class DocumentSelectorModal extends Modal {
 			};
 		}
 
-		// Toggle dropdown visibility
+		// instead of leaving the user staring at a silently empty dropdown
+		if (tags.length === 0) {
+			const emptyItem = tagDropdown.createDiv({cls: 'obsidian-paperless-tag-empty'});
+			emptyItem.setText('No tags available');
+		}
+
+		// Toggle dropdown visibility. setCssStyles is used rather than a bare
+		// style assignment because the stylesheet sets `display: none`.
 		tagFilterButton.onclick = (e) => {
 			e.stopPropagation();
-			tagDropdown.style.display = tagDropdown.style.display === 'none' ? 'block' : 'none';
+			const isOpen = tagDropdown.style.display === 'block';
+			tagDropdown.setCssStyles({display: isOpen ? 'none' : 'block'});
 		};
 
-		// Close dropdown when clicking outside
-		contentEl.addEventListener('click', () => {
-			tagDropdown.style.display = 'none';
-		});
+		// Close dropdown when clicking outside. The dropdown lives inside
+		// contentEl, so a listener on contentEl would also receive clicks from
+		// the dropdown's own items and close it immediately. Listen on document
+		// and stop the event at the dropdown instead. Modal is not a Component,
+		// so the listener is removed manually in onClose().
+		this.closeDropdownHandler = (e: Event) => {
+			if (e.target && tagFilterContainer.contains(e.target as Node)) {
+				return;
+			}
+			tagDropdown.setCssStyles({display: 'none'});
+		};
+		document.addEventListener('click', this.closeDropdownHandler);
+		tagDropdown.addEventListener('click', (e) => e.stopPropagation());
 
 		const refreshButton = header.createEl('button', {
 			text: '\u21bb',
@@ -438,7 +743,8 @@ class DocumentSelectorModal extends Modal {
 				this.onClose();
 				this.onOpen();
 			} catch (error) {
-				new Notice('Failed to refresh cache');
+				// message, so API failures are visible in the UI too
+				new Notice('Failed to refresh cache: ' + (error && error.message ? error.message : error));
 				console.error('Refresh failed:', error);
 				refreshButton.disabled = false;
 				refreshButton.setText('\u21bb Refresh');
@@ -446,7 +752,9 @@ class DocumentSelectorModal extends Modal {
 		};
 
 		const totalWidth = contentEl.innerWidth;
-		this.availableDocumentIds = cachedResult.json['all'].sort((a:String, b:String) => {return +a - +b}).reverse();
+		// the old cachedResult.json['all'] access threw "Cannot read properties of
+		// undefined (reading 'sort')" on newer paperless builds.
+		this.availableDocumentIds = sortDocumentIds(cachedDocumentIds);
 		const totalAssets = this.availableDocumentIds.length;
 
 		// Create scroll container
@@ -477,26 +785,25 @@ class DocumentSelectorModal extends Modal {
 				
 			if (searchQuery === '' && this.selectedTags.size === 0) {
 				// Reset to cached results
-				this.availableDocumentIds = cachedResult.json['all'].sort((a:String, b:String) => {return +a - +b}).reverse();
+				this.availableDocumentIds = sortDocumentIds(cachedDocumentIds);
 			} else {
 				// Perform search
-				searchInput.disabled = true;
+				// focus after each keystroke (issue #33)
 				loadingDiv.setText('Searching...');
 				loadingDiv.style.display = 'block';
 				
 				try {
 					const tagIds = Array.from(this.selectedTags);
 					const searchResults = await searchPaperlessDocuments(this.settings, searchQuery, tagIds);
-					this.availableDocumentIds = searchResults.sort((a:String, b:String) => {return +a - +b}).reverse();
+					this.availableDocumentIds = sortDocumentIds(searchResults);
 				} catch (error) {
 					new Notice('Failed to search documents');
 					console.error('Search failed:', error);
 					loadingDiv.style.display = 'none';
 				} finally {
-					searchInput.disabled = false;
 					loadingDiv.style.display = 'none';
 				}
-			}				// Reset and reload modal content
+			}
 				this.currentPage = 0;
 				this.loadedAssets.clear();
 				left.empty();
@@ -582,7 +889,7 @@ class DocumentSelectorModal extends Modal {
 						to: { line: cursor.line, ch: cursor.ch }
 					}
 				}
-				createDocument(this.editor, this.settings, documentInfo);
+				createDocument(this.app, this.editor, this.settings, documentInfo);
 				overallDiv.setCssStyles({opacity: '0.5'});
 			};
 			
@@ -610,6 +917,10 @@ class DocumentSelectorModal extends Modal {
 		}
 		if (this.searchTimeout) {
 			clearTimeout(this.searchTimeout);
+		}
+		if (this.closeDropdownHandler) {
+			document.removeEventListener('click', this.closeDropdownHandler);
+			this.closeDropdownHandler = null;
 		}
 		this.loadedAssets.clear();
 		const {contentEl} = this;
