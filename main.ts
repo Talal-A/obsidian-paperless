@@ -33,6 +33,14 @@ export default class ObsidianPaperless extends Plugin {
 		});
 
 		this.addCommand({
+			id: 'insert-link-from-paperless',
+			name: 'Insert document link',
+			editorCallback: (editor: Editor) => {
+				new DocumentSelectorModal(this.app, editor, this.settings, 'link').open();
+			}
+		});
+
+		this.addCommand({
 			id: 'replace-with-paperless',
 			name: 'Replace URL with document',
 			editorCallback: (editor: Editor) => {
@@ -262,6 +270,26 @@ async function createDocument(editor: Editor, settings: PluginSettings, paperles
 	editor.replaceRange('![[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
 }
 
+async function insertDocumentLink(editor: Editor, settings: PluginSettings, documentId: string) {
+	const url = new URL(settings.paperlessUrl + '/api/documents/' + documentId + '/');
+	let title = 'Document ' + documentId;
+	try {
+		const result = await requestUrl({
+			url: url.toString(),
+			headers: { 'Authorization': 'token ' + settings.paperlessAuthToken }
+		});
+		if (result.status === 200 && result.json['title']) {
+			title = result.json['title'];
+		}
+	} catch (e) {
+		console.error('Failed to fetch document title:', e);
+	}
+
+	const detailUrl = new URL(settings.paperlessUrl + '/documents/' + documentId + '/details');
+	const cursor = editor.getCursor();
+	editor.replaceRange('[' + title + '](' + detailUrl.href + ')', cursor, cursor);
+}
+
 async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: string, tagIds: number[] = []): Promise<string[]> {
 	let urlStr = settings.paperlessUrl + '/api/documents/?format=json';
 	if (searchQuery) {
@@ -293,6 +321,7 @@ async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: s
 class DocumentSelectorModal extends Modal {
 	editor: Editor;
 	settings: PluginSettings;
+	mode: 'embed' | 'link';
 	currentPage: number;
 	batchSize: number;
 	loadedAssets: Map<number, HTMLElement>;
@@ -303,10 +332,11 @@ class DocumentSelectorModal extends Modal {
 	selectedTags: Set<number>;
 	availableDocumentIds: string[];
 
-	constructor(app: App, editor: Editor, settings: PluginSettings) {
+	constructor(app: App, editor: Editor, settings: PluginSettings, mode: 'embed' | 'link' = 'embed') {
 		super(app);
 		this.editor = editor;
 		this.settings = settings;
+		this.mode = mode;
 		this.currentPage = 0;
 		this.batchSize = 6;
 		this.loadedAssets = new Map();
@@ -358,7 +388,7 @@ class DocumentSelectorModal extends Modal {
 		const header = contentEl.createDiv({cls: 'obsidian-paperless-header'});
 
 		const titleDiv = header.createDiv({cls: 'obsidian-paperless-title'});
-		titleDiv.setText('Insert document');
+		titleDiv.setText(this.mode === 'link' ? 'Insert document link' : 'Insert document');
 
 		// Search box in header
 		const searchInput = header.createEl('input', {
@@ -574,15 +604,19 @@ class DocumentSelectorModal extends Modal {
 			imgElement.style.cursor = 'pointer';
 			
 			imgElement.onclick = () => {
-				const cursor = this.editor.getCursor();
-				const documentInfo: PaperlessInsertionData = {
-					documentId: documentId,
-					range: { 
-						from: { line: cursor.line, ch: cursor.ch },
-						to: { line: cursor.line, ch: cursor.ch }
+				if (this.mode === 'link') {
+					insertDocumentLink(this.editor, this.settings, documentId);
+				} else {
+					const cursor = this.editor.getCursor();
+					const documentInfo: PaperlessInsertionData = {
+						documentId: documentId,
+						range: {
+							from: { line: cursor.line, ch: cursor.ch },
+							to: { line: cursor.line, ch: cursor.ch }
+						}
 					}
+					createDocument(this.editor, this.settings, documentInfo);
 				}
-				createDocument(this.editor, this.settings, documentInfo);
 				overallDiv.setCssStyles({opacity: '0.5'});
 			};
 			
