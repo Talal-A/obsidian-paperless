@@ -47,6 +47,9 @@ The following commands are available for use.
 #### Insert document
 The standard insertion command. Please note you must have an open editor focused to use this command. Brings up the document selection modal.
 
+#### Insert document in current folder
+Like **Insert document**, but creates the PDF++ dummy file beside the active note instead of in the configured document storage path. After selecting a document, leave the optional name blank to use the default `paperless-ID` name or enter a custom name.
+
 #### Refresh document cache
 The "Insert document" command caches some information such as available documents, tags, and other metadata when it is first run. If you find that new documents or changes are not showing up in the document selection modal, running this command will refresh the caches.
 

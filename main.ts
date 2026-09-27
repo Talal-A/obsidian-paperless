@@ -42,6 +42,19 @@ export default class ObsidianPaperless extends Plugin {
 		});
 
 		this.addCommand({
+			id: 'insert-from-paperless-in-current-folder',
+			name: 'Insert document in current folder',
+			editorCallback: (editor: Editor) => {
+				const activeFile = this.app.workspace.getActiveFile();
+				if (!activeFile) {
+					new Notice('Open a note before inserting a Paperless document.');
+					return;
+				}
+				new DocumentSelectorModal(this.app, editor, this.settings, 'embed', activeFile.parent?.path ?? '', true).open();
+			}
+		});
+
+		this.addCommand({
 			id: 'insert-link-from-paperless',
 			name: 'Insert document link',
 			editorCallback: (editor: Editor) => {
@@ -523,24 +536,46 @@ async function resolveShareLink(settings: PluginSettings, documentId: string) {
 	};
 }
 
-async function ensureDocumentFile(app: App, settings: PluginSettings, documentId: string): Promise<string> {
-	const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
+function createDocumentFilename(documentId: string, extension: string, customName?: string): string {
+	const name = customName?.trim();
+	if (!name) {
+		return 'paperless-' + documentId + extension;
+	}
+	if (name === '.' || name === '..' || /[\\/:*?"<>|#[\]^]/.test(name)) {
+		throw new Error('The custom document name contains invalid characters');
+	}
+	return name.replace(/\.(pdf|share\.md)$/i, '') + extension;
+}
+
+async function ensureDocumentFile(app: App, settings: PluginSettings, documentId: string, folder?: string, customName?: string): Promise<string> {
+	const folderPath = normalizePath(folder ?? settings.documentStoragePath).replace(/^\/+/, '');
 	if (folderPath && !(app.vault.getAbstractFileByPath(folderPath) instanceof TFolder)) {
 		await app.vault.createFolder(folderPath);
 	}
 	const link = await resolveShareLink(settings, documentId);
 	if (!link) throw new Error('No usable share link found');
-	const filename = 'paperless-' + documentId + (link.usePdfName ? '.pdf' : '.share.md');
+	const filename = createDocumentFilename(documentId, link.usePdfName ? '.pdf' : '.share.md', customName);
 	const documentPath = folderPath ? folderPath + '/' + filename : filename;
-	if (!(app.vault.getAbstractFileByPath(documentPath) instanceof TFile)) {
+	const existingFile = app.vault.getAbstractFileByPath(documentPath);
+	if (existingFile instanceof TFile && customName?.trim()) {
+		throw new Error('A file with that custom name already exists');
+	}
+	if (!(existingFile instanceof TFile)) {
 		await app.vault.create(documentPath, link.url.href);
 	}
 	return filename;
 }
 
-async function createDocument(app: App, editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData): Promise<boolean> {
+async function createDocument(
+	app: App,
+	editor: Editor,
+	settings: PluginSettings,
+	paperlessUrl: PaperlessInsertionData,
+	folderPath?: string,
+	customName?: string
+): Promise<boolean> {
 	try {
-		const filename = await ensureDocumentFile(app, settings, paperlessUrl.documentId);
+		const filename = await ensureDocumentFile(app, settings, paperlessUrl.documentId, folderPath, customName);
 		const linkPrefix = settings.embedDocuments && filename.endsWith('.pdf') ? '![' : '[';
 		editor.replaceRange(linkPrefix + '[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
 		return true;
@@ -612,10 +647,53 @@ async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: s
 	}
 }
 
+class DocumentNameModal extends Modal {
+	private resolveName: ((name: string | null) => void) | null = null;
+
+	getName(): Promise<string | null> {
+		return new Promise((resolve) => {
+			this.resolveName = resolve;
+			this.open();
+		});
+	}
+
+	onOpen() {
+		this.titleEl.setText('Name document');
+		const input = this.contentEl.createEl('input', {
+			type: 'text',
+			placeholder: 'Optional custom name'
+		});
+		input.focus();
+
+		const buttons = this.contentEl.createDiv();
+		const insertButton = buttons.createEl('button', { text: 'Insert' });
+		const finish = (name: string | null) => {
+			this.resolveName?.(name);
+			this.resolveName = null;
+			this.close();
+		};
+
+		insertButton.onclick = () => finish(input.value);
+		input.addEventListener('keydown', (event) => {
+			if (event.key === 'Enter') {
+				finish(input.value);
+			}
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+		this.resolveName?.(null);
+		this.resolveName = null;
+	}
+}
+
 class DocumentSelectorModal extends Modal {
 	editor: Editor;
 	settings: PluginSettings;
 	mode: 'embed' | 'link';
+	folderPath: string | undefined;
+	promptForCustomName: boolean;
 	currentPage: number;
 	batchSize: number;
 	loadedAssets: Map<number, HTMLElement>;
@@ -628,11 +706,13 @@ class DocumentSelectorModal extends Modal {
 	availableDocumentIds: string[];
 	closeDropdownHandler: ((e: Event) => void) | null;
 
-	constructor(app: App, editor: Editor, settings: PluginSettings, mode: 'embed' | 'link' = 'embed') {
+	constructor(app: App, editor: Editor, settings: PluginSettings, mode: 'embed' | 'link' = 'embed', folderPath?: string, promptForCustomName = false) {
 		super(app);
 		this.editor = editor;
 		this.settings = settings;
 		this.mode = mode;
+		this.folderPath = folderPath;
+		this.promptForCustomName = promptForCustomName;
 		this.currentPage = 0;
 		this.batchSize = 6;
 		this.loadedAssets = new Map();
@@ -949,6 +1029,12 @@ class DocumentSelectorModal extends Modal {
 				if (this.mode === 'link') {
 					insertDocumentLink(this.editor, this.settings, documentId);
 				} else {
+					const customName = this.promptForCustomName
+						? await new DocumentNameModal(this.app).getName()
+						: '';
+					if (customName === null) {
+						return;
+					}
 					const cursor = this.editor.getCursor();
 					const documentInfo: PaperlessInsertionData = {
 						documentId: documentId,
@@ -962,7 +1048,9 @@ class DocumentSelectorModal extends Modal {
 						this.app,
 						this.editor,
 						this.settings,
-						documentInfo
+						documentInfo,
+						this.folderPath,
+						customName
 					);
 
 					if (!created) {
