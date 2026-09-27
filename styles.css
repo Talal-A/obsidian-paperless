@@ -37,6 +37,7 @@
 }
 
 .obsidian-paperless-scroll-container {
+    max-height: 70vh;
     overflow-y: auto;
 }
 
@@ -64,6 +65,7 @@
     width: 100%;
     height: auto;
     display: block;
+    cursor: pointer;
 }
 
 .obsidian-paperless-imageDiv {
@@ -84,6 +86,10 @@
     text-align: center;
     padding: 16px;
     font-size: 12px;
+}
+
+.obsidian-paperless-loading.is-hidden {
+    display: none;
 }
 
 .obsidian-paperless-search-input {
@@ -116,6 +122,10 @@
     overflow-y: auto;
     z-index: 1000;
     min-width: 200px;
+}
+
+.obsidian-paperless-tag-dropdown.is-visible {
+    display: block;
 }
 
 .obsidian-paperless-tag-item {

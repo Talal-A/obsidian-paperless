@@ -1,5 +1,4 @@
 import { App, Editor, EditorRange, Modal, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting, TFolder, TFile } from 'obsidian';
-import { escapeRegExp } from 'lodash';
 
 interface PluginSettings {
 	paperlessUrl: string;
@@ -14,6 +13,10 @@ interface PaperlessInsertionData {
 }
 
 type FileVersion = 'archive' | 'original';
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 // Which file version a fresh share link should point at.
 // 'archive' is the paperless-ngx default and always yields a PDF that
@@ -68,7 +71,7 @@ export default class ObsidianPaperless extends Plugin {
 			editorCallback: (editor: Editor) => {
 				const paperlessUrl = searchPaperlessUrl(editor, this.settings);
 				if (paperlessUrl) {
-					createDocument(this.app, editor, this.settings, paperlessUrl);
+					void createDocument(this.app, editor, this.settings, paperlessUrl);
 				}
 			}
 		});
@@ -219,7 +222,7 @@ async function testConnection(settings: PluginSettings) {
 		}
 	} catch(exception) {
 		new Notice("Failed to connect to " + settings.paperlessUrl + " - check the console for additional information.")
-		console.log("Failed connection to " + url + " with error: " + exception)
+		console.error('Failed connection to', url, exception);
 	}
 }
 
@@ -307,7 +310,6 @@ function searchPaperlessUrl(editor: Editor, settings: PluginSettings): Paperless
 
 	// find a matching URL variant
 	for (const regex of urlVariants) {
-		console.log("Regex: " + regex);
 		const match = text.match(regex);
 		if (match) {
 			return {
@@ -330,10 +332,6 @@ function searchPaperlessUrl(editor: Editor, settings: PluginSettings): Paperless
 	return null;
 }
 
-function fileVersionLabel(version: FileVersion): string {
-	return version === 'archive' ? 'archived PDF' : 'original file';
-}
-
 interface VersionChoice {
 	version: FileVersion;
 	hasArchive: boolean;
@@ -352,7 +350,7 @@ async function fetchDocumentInfo(settings: PluginSettings, documentId: string): 
 			}
 		})
 		if (result.status != 200) {
-			console.error("An exception occurred in fetchDocumentInfo. Response: " + result);
+			console.error('An exception occurred in fetchDocumentInfo. Response:', result);
 			return null;
 		}
 		return result.json;
@@ -436,7 +434,7 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 			}
 		})
 		if (result.status != 200) {
-			console.error("An exception occurred in getExistingShareLink. Response: " + result);
+			console.error('An exception occurred in getExistingShareLink. Response:', result);
 			return null;
 		}
 		let item = findExistingLink(result.json, fileVersion);
@@ -444,7 +442,7 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 			return {url: makeShareUrl(settings, item['slug']), fileVersion: fileVersion};
 		}
 	} catch (e) {
-		console.error("An exception occurred in getExistingShareLink. Exception: " + e + " and response " + result);
+		console.error('An exception occurred in getExistingShareLink.', e, result);
 	}
 
 	return null;
@@ -467,7 +465,7 @@ async function createShareLink(settings: PluginSettings, documentId: string, fil
 			return result.json['slug'];
 		}
 	} catch (e) {
-		console.error("An exception occurred in createShareLink. Exception: " + e + " and response " + result);
+		console.error('An exception occurred in createShareLink.', e, result);
 	}
 
 	return null;
@@ -500,7 +498,6 @@ async function resolveShareLink(settings: PluginSettings, documentId: string) {
 
 	let link = await getShareLink(settings, documentId, choice.version);
 	if (!link) {
-		console.log("Paperless: falling back to the " + fileVersionLabel(fallback) + " for document " + documentId);
 		link = await getShareLink(settings, documentId, fallback);
 	}
 
@@ -636,7 +633,6 @@ async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: s
 	if (tagIds.length > 0) {
 		urlStr += '&tags__id__all=' + tagIds.join(',');
 	}
-	console.log("Querying " + urlStr)
 	const url = new URL(urlStr);
 	try {
 		const documents = await fetchAllResults(settings, url.toString(), {}, 'search results');
@@ -763,7 +759,7 @@ class DocumentSelectorModal extends Modal {
 			if (!tagData) {
 				continue;
 			}
-			const tagStr = currentTag.createEl('span', {text: tagData['name']});
+			const tagStr = currentTag.createSpan({text: tagData['name']});
 			tagStr.setCssStyles({color: tagData['text_color'], fontSize: '0.7em'});
 			currentTag.setCssStyles({background: tagData['color'], borderRadius: '8px', padding: '2px', marginTop: '1px', marginRight: '5px'})
 		}
@@ -814,9 +810,11 @@ class DocumentSelectorModal extends Modal {
 
 			const checkbox = tagItem.createEl('input', {type: 'checkbox'});
 
-			const tagLabel = tagItem.createEl('span', {text: tagData['name']});
-			tagLabel.style.color = tagData['text_color'];
-			tagLabel.style.background = tagData['color'];
+			const tagLabel = tagItem.createSpan({text: tagData['name']});
+			tagLabel.setCssProps({
+				color: tagData['text_color'],
+				background: tagData['color']
+			});
 
 			const updateTagSelection = () => {
 				if (checkbox.checked) {
@@ -827,7 +825,7 @@ class DocumentSelectorModal extends Modal {
 				// Update button text to show count
 				tagFilterButton.setText(this.selectedTags.size > 0 ? `Tags (${this.selectedTags.size})` : 'Tags');
 				// Close dropdown
-				tagDropdown.style.display = 'none';
+				tagDropdown.classList.remove('is-visible');
 				// Trigger search with new tag filter
 				searchInput.dispatchEvent(new Event('input'));
 			};
@@ -854,8 +852,7 @@ class DocumentSelectorModal extends Modal {
 		// style assignment because the stylesheet sets `display: none`.
 		tagFilterButton.onclick = (e) => {
 			e.stopPropagation();
-			const isOpen = tagDropdown.style.display === 'block';
-			tagDropdown.setCssStyles({display: isOpen ? 'none' : 'block'});
+			tagDropdown.classList.toggle('is-visible');
 		};
 
 		// Close dropdown when clicking outside. The dropdown lives inside
@@ -867,7 +864,7 @@ class DocumentSelectorModal extends Modal {
 			if (e.target && tagFilterContainer.contains(e.target as Node)) {
 				return;
 			}
-			tagDropdown.setCssStyles({display: 'none'});
+			tagDropdown.classList.remove('is-visible');
 		};
 		document.addEventListener('click', this.closeDropdownHandler);
 		tagDropdown.addEventListener('click', (e) => e.stopPropagation());
@@ -883,7 +880,7 @@ class DocumentSelectorModal extends Modal {
 				await refreshCacheFromPaperless(this.settings, false);
 				// Reload the modal
 				this.onClose();
-				this.onOpen();
+				void this.onOpen();
 			} catch (error) {
 				// message, so API failures are visible in the UI too
 				new Notice('Failed to refresh cache: ' + (error && error.message ? error.message : error));
@@ -900,9 +897,6 @@ class DocumentSelectorModal extends Modal {
 		// Create scroll container
 		this.scrollContainer = contentEl.createDiv({cls: 'obsidian-paperless-scroll-container'});
 		this.scrollContainer.setAttribute('data-paperless-modal-content', 'true');
-		this.scrollContainer.style.maxHeight = '70vh';
-		this.scrollContainer.style.overflowY = 'auto';
-
 		const row = this.scrollContainer.createDiv({cls: 'obsidian-paperless-row'});
 		const leftColumn = row.createDiv({cls: 'obsidian-paperless-column'});
 		const rightColumn = row.createDiv({cls: 'obsidian-paperless-column'});
@@ -910,18 +904,18 @@ class DocumentSelectorModal extends Modal {
 		const right = rightColumn.createDiv({cls: 'obsidian-paperless-column-content'});
 
 		// Create loading indicator inside scroll container
-		const loadingDiv = this.scrollContainer.createDiv({cls: 'obsidian-paperless-loading'});
+		const loadingDiv = this.scrollContainer.createDiv({cls: 'obsidian-paperless-loading is-hidden'});
 		loadingDiv.setText(`Showing ${Math.min(Math.max(this.batchSize * 3, 20), totalAssets)} of ${totalAssets} documents. Scroll to load more.`);
-		loadingDiv.style.display = 'none';
 
-		searchInput.addEventListener('input', async (e) => {
+		searchInput.addEventListener('input', (e) => {
 			const requestId = ++this.searchGeneration;
 			if (this.searchTimeout) {
-				clearTimeout(this.searchTimeout);
+				window.activeWindow.clearTimeout(this.searchTimeout);
 			}
 
 			// Debounce: wait 500ms after user stops typing
-			this.searchTimeout = window.setTimeout(async () => {
+			this.searchTimeout = window.activeWindow.setTimeout(() => {
+				void (async () => {
 				if (requestId !== this.searchGeneration) return;
 				const searchQuery = (e.target as HTMLInputElement).value.trim();
 
@@ -932,7 +926,7 @@ class DocumentSelectorModal extends Modal {
 				// Perform search
 				// focus after each keystroke (issue #33)
 				loadingDiv.setText('Searching...');
-				loadingDiv.style.display = 'block';
+				loadingDiv.classList.remove('is-hidden');
 
 				try {
 					const tagIds = Array.from(this.selectedTags);
@@ -943,9 +937,9 @@ class DocumentSelectorModal extends Modal {
 					if (requestId !== this.searchGeneration) return;
 					new Notice('Failed to search documents');
 					console.error('Search failed:', error);
-					loadingDiv.style.display = 'none';
+					loadingDiv.classList.add('is-hidden');
 				} finally {
-					loadingDiv.style.display = 'none';
+					loadingDiv.classList.add('is-hidden');
 				}
 			}
 				this.currentPage = 0;
@@ -961,6 +955,11 @@ class DocumentSelectorModal extends Modal {
 			// Initial load: load more items to ensure scrollbar appears on large screens
 			const initialBatchSize = Math.max(this.batchSize * 3, 20);
 			this.loadBatch(left, right, totalWidth, this.availableDocumentIds, 0, Math.min(initialBatchSize, this.availableDocumentIds.length), loadingDiv);
+				})().catch((error) => {
+					console.error('Paperless document search failed:', error);
+					new Notice('Failed to search documents');
+					loadingDiv.classList.add('is-hidden');
+				});
 			}, 500);
 		});
 
@@ -978,10 +977,10 @@ class DocumentSelectorModal extends Modal {
 
 		this.scrollContainer.addEventListener('scroll', () => {
 			if (this.scrollTimeout) {
-				clearTimeout(this.scrollTimeout);
+				window.activeWindow.clearTimeout(this.scrollTimeout);
 			}
 
-			this.scrollTimeout = window.setTimeout(() => {
+			this.scrollTimeout = window.activeWindow.setTimeout(() => {
 				this.checkAndLoadMore(left, right, totalWidth, loadingDiv);
 			}, 150); // Throttle to 150ms
 		});
@@ -1008,7 +1007,7 @@ class DocumentSelectorModal extends Modal {
 		if (this.isLoading || startIndex >= availableDocumentIds.length) return;
 
 		this.isLoading = true;
-		loadingDiv.style.display = 'block';
+		loadingDiv.classList.remove('is-hidden');
 
 		for (let i = startIndex; i < endIndex; i++) {
 			if (this.loadedAssets.has(i)) continue;
@@ -1019,15 +1018,15 @@ class DocumentSelectorModal extends Modal {
 			const imageDiv = overallDiv.createDiv({cls: 'obsidian-paperless-imageDiv'});
 			const tagDiv = overallDiv.createDiv({cls: 'obsidian-paperless-tagDiv'});
 
-			this.displayTags(tagDiv, documentId);
+			void this.displayTags(tagDiv, documentId).catch((error) => {
+				console.error('Failed to display Paperless document tags:', error);
+			});
 
 			const imgElement = imageDiv.createEl('img');
 			imgElement.width = (totalWidth / 2) - 5;
-			imgElement.style.cursor = 'pointer';
-
 			imgElement.onclick = async () => {
 				if (this.mode === 'link') {
-					insertDocumentLink(this.editor, this.settings, documentId);
+					await insertDocumentLink(this.editor, this.settings, documentId);
 				} else {
 					const customName = this.promptForCustomName
 						? await new DocumentNameModal(this.app).getName()
@@ -1073,10 +1072,10 @@ class DocumentSelectorModal extends Modal {
 		this.currentPage = endIndex;
 		loadingDiv.setText(`Showing ${endIndex} of ${availableDocumentIds.length} documents. Scroll to load more.`);
 
-		setTimeout(() => {
+		window.activeWindow.setTimeout(() => {
 			this.isLoading = false;
 			if (endIndex >= availableDocumentIds.length) {
-				loadingDiv.style.display = 'none';
+				loadingDiv.classList.add('is-hidden');
 			}
 		}, 100);
 	}
@@ -1086,10 +1085,10 @@ class DocumentSelectorModal extends Modal {
 		this.scrollContainer = null;
 		this.searchGeneration++;
 		if (this.scrollTimeout) {
-			clearTimeout(this.scrollTimeout);
+			window.activeWindow.clearTimeout(this.scrollTimeout);
 		}
 		if (this.searchTimeout) {
-			clearTimeout(this.searchTimeout);
+			window.activeWindow.clearTimeout(this.searchTimeout);
 		}
 		if (this.closeDropdownHandler) {
 			document.removeEventListener('click', this.closeDropdownHandler);
@@ -1153,10 +1152,10 @@ class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('Test connection')
 			.setDesc('Validate the connection between obsidian and your paperless instance.')
-			.addButton(async (button) => {
+			.addButton((button) => {
 				button.setButtonText("Test connection")
-				button.onClick(async() => {
-					testConnection(this.plugin.settings)
+				button.onClick(() => {
+					void testConnection(this.plugin.settings);
 				})
 			})
 	}
