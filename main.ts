@@ -85,18 +85,23 @@ export default class ObsidianPaperless extends Plugin {
 }
 
 let cachedResult: RequestUrlResponse;
-const tagCache = new Map();
+const documentCache = new Map<string, Record<string, any>>();
+const tagCache = new Map<number, Record<string, any>>();
 
 interface PaginatedResponse<T> {
 	response: RequestUrlResponse;
 	results: T[];
 }
 
-async function fetchAllPages<T>(initialUrl: URL, settings: PluginSettings): Promise<PaginatedResponse<T>> {
+type PageReceivedCallback<T> = (response: RequestUrlResponse, pageResults: T[], results: T[], pageCount: number) => void;
+
+async function fetchAllPages<T>(initialUrl: URL, settings: PluginSettings, onPageReceived?: PageReceivedCallback<T>): Promise<PaginatedResponse<T>> {
 	const visitedUrls = new Set<string>();
+	initialUrl.searchParams.set('page_size', '100');
 	let nextUrl: string | null = initialUrl.toString();
 	let firstResponse: RequestUrlResponse | null = null;
 	const results: T[] = [];
+	let pageCount = 0;
 
 	while (nextUrl !== null) {
 		if (visitedUrls.has(nextUrl)) {
@@ -110,6 +115,7 @@ async function fetchAllPages<T>(initialUrl: URL, settings: PluginSettings): Prom
 				'Authorization': 'token ' + settings.paperlessAuthToken
 			}
 		});
+		pageCount++;
 		firstResponse ??= result;
 
 		if (result.status < 200 || result.status >= 300) {
@@ -122,8 +128,9 @@ async function fetchAllPages<T>(initialUrl: URL, settings: PluginSettings): Prom
 			(payload.next !== null && typeof payload.next !== 'string')) {
 			throw new Error('Paperless returned an invalid paginated response');
 		}
-
 		results.push(...payload.results);
+		onPageReceived?.(result, payload.results, results, pageCount);
+		onPageReceived?.(result, payload.results, results, pageCount);
 		nextUrl = payload.next === null ? null : new URL(payload.next, nextUrl).toString();
 	}
 
@@ -153,15 +160,27 @@ async function testConnection(settings: PluginSettings) {
 	}
 }
 
-async function refreshCacheFromPaperless(settings: PluginSettings, silent=true) {
+async function refreshCacheFromPaperless(settings: PluginSettings, silent=true, onDocumentsUpdated?: () => void) {
 	const url = new URL(settings.paperlessUrl + '/api/documents/?format=json');
-	const documentResult = await fetchAllPages<Record<string, any>>(url, settings);
+	const tagUrl = new URL(settings.paperlessUrl + '/api/tags/?format=json');
+	documentCache.clear();
+	const [documentResult, tagResult] = await Promise.all([
+		fetchAllPages<Record<string, any>>(url, settings, (response, pageResults, results, pageCount) => {
+			if (pageCount === 1) {
+				cachedResult = response;
+			}
+			cachedResult.json['results'] = results;
+			for (const document of pageResults) {
+				documentCache.set(document.id.toString(), document);
+			}
+			onDocumentsUpdated?.();
+		}),
+		fetchAllPages<Record<string, any>>(tagUrl, settings)
+	]);
 	cachedResult = documentResult.response;
 	cachedResult.json['results'] = documentResult.results;
 
 	// Cache data relating to tags
-	const tagUrl = new URL(settings.paperlessUrl + '/api/tags/?format=json');
-	const tagResult = await fetchAllPages<Record<string, any>>(tagUrl, settings);
 	tagCache.clear();
 	for (let i = 0; i < tagResult.results.length; i++) {
 		const current = tagResult.results[i];
@@ -493,15 +512,12 @@ class DocumentSelectorModal extends Modal {
 		imgElement.src = URL.createObjectURL(new Blob([result.arrayBuffer]));
 	}
 
-	async displayTags(tagDiv: HTMLDivElement, documentId: string) {
-		const thumbUrl = this.settings.paperlessUrl + '/api/documents/' + documentId + '/';
-		const result = await requestUrl({
-			url: thumbUrl.toString(),
-			headers: {
-				'Authorization': 'token ' + this.settings.paperlessAuthToken
-			}
-		})
-		const tags = result.json['tags']
+	displayTags(tagDiv: HTMLDivElement, documentId: string) {
+		const tags = documentCache.get(documentId)?.tags;
+		if (!Array.isArray(tags)) {
+			console.warn('No cached tags found for Paperless document ' + documentId);
+			return;
+		}
 		for (let x = 0; x < tags.length; x++) {
 			const currentTag = tagDiv.createDiv();
 			const tagData = tagCache.get(tags[x]);
@@ -516,9 +532,23 @@ class DocumentSelectorModal extends Modal {
 
 	async onOpen() {
 		const {contentEl} = this;
+		let cacheRefresh: Promise<void> | null = null;
 
 		if (cachedResult == null) {
-			await refreshCacheFromPaperless(this.settings);
+			let resolveInitialDocuments: () => void = () => {
+				throw new Error('Initial document cache resolver was not initialized');
+			};
+			let rejectInitialDocuments: (reason?: unknown) => void = () => {
+				throw new Error('Initial document cache rejecter was not initialized');
+			};
+			const initialDocuments = new Promise<void>((resolve, reject) => {
+				resolveInitialDocuments = resolve;
+				rejectInitialDocuments = reject;
+			});
+			const refresh = refreshCacheFromPaperless(this.settings, true, resolveInitialDocuments);
+			cacheRefresh = refresh;
+			void refresh.catch(rejectInitialDocuments);
+			await initialDocuments;
 		}
 
 		// Create header with title and refresh button
@@ -630,7 +660,7 @@ class DocumentSelectorModal extends Modal {
 
 		// Create loading indicator inside scroll container
 		const loadingDiv = this.scrollContainer.createDiv({cls: 'obsidian-paperless-loading'});
-		loadingDiv.setText('Loading documents...');
+		loadingDiv.setText(`Showing ${Math.min(Math.max(this.batchSize * 3, 20), totalAssets)} of ${totalAssets} documents. Scroll to load more.`);
 		loadingDiv.style.display = 'none';
 
 		searchInput.addEventListener('input', async (e) => {
@@ -692,6 +722,19 @@ class DocumentSelectorModal extends Modal {
 		// Initial load: load more items to ensure scrollbar appears on large screens
 		const initialBatchSize = Math.max(this.batchSize * 3, 20); // Load at least 20 items initially
 		this.loadBatch(left, right, totalWidth, this.availableDocumentIds, 0, Math.min(initialBatchSize, totalAssets), loadingDiv);
+
+		if (cacheRefresh) {
+			void cacheRefresh.then(() => {
+				if (!this.scrollContainer || searchInput.value !== '' || this.selectedTags.size > 0) {
+					return;
+				}
+				this.availableDocumentIds = cachedResult.json['results'].map((d: Record<string, any>) => d.id.toString()).sort((a:string, b:string) => {return +a - +b}).reverse();
+				loadingDiv.setText(`Showing ${this.currentPage} of ${this.availableDocumentIds.length} documents. Scroll to load more.`);
+			}).catch((error) => {
+				new Notice('Failed to load all Paperless documents');
+				console.error('Cache refresh failed:', error);
+			});
+		}
 	}
 
 	private setupScrollListener(left: HTMLElement, right: HTMLElement, totalWidth: number, loadingDiv: HTMLElement) {
@@ -777,11 +820,15 @@ class DocumentSelectorModal extends Modal {
 				overallDiv.setText('Failed to load');
 			};
 
-			this.displayThumbnail(imgElement, documentId);
+			this.displayThumbnail(imgElement, documentId).catch((error) => {
+				console.error('Failed to load thumbnail for Paperless document ' + documentId + ':', error);
+				overallDiv.setText('Failed to load');
+			});
 			this.loadedAssets.set(i, overallDiv);
 		}
 
 		this.currentPage = endIndex;
+		loadingDiv.setText(`Showing ${endIndex} of ${availableDocumentIds.length} documents. Scroll to load more.`);
 
 		setTimeout(() => {
 			this.isLoading = false;
