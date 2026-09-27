@@ -576,6 +576,7 @@ async function importMissingDocuments(app: App, editor: Editor, settings: Plugin
 
 async function insertDocumentLink(editor: Editor, settings: PluginSettings, documentId: string) {
 	const url = new URL(settings.paperlessUrl + '/api/documents/' + documentId + '/');
+	const cursor = editor.getCursor();
 	let title = 'Document ' + documentId;
 	try {
 		const result = await requestUrl({
@@ -588,9 +589,7 @@ async function insertDocumentLink(editor: Editor, settings: PluginSettings, docu
 	} catch (e) {
 		console.error('Failed to fetch document title:', e);
 	}
-
 	const detailUrl = new URL(settings.paperlessUrl + '/documents/' + documentId + '/details');
-	const cursor = editor.getCursor();
 	editor.replaceRange('[' + title + '](' + detailUrl.href + ')', cursor, cursor);
 }
 
@@ -658,8 +657,22 @@ class DocumentSelectorModal extends Modal {
 		imgElement.src = URL.createObjectURL(new Blob([result.arrayBuffer]));
 	}
 
-	displayTags(tagDiv: HTMLDivElement, documentId: string) {
-		const tags = documentCache.get(documentId)?.tags;
+	async displayTags(tagDiv: HTMLDivElement, documentId: string) {
+		let tags = documentCache.get(documentId)?.tags;
+		if (!Array.isArray(tags)) {
+			try {
+				const result = await requestUrl({
+					url: this.settings.paperlessUrl + '/api/documents/' + documentId + '/',
+					headers: {'Authorization': 'token ' + this.settings.paperlessAuthToken}
+				});
+				if (result.status === 200) {
+					documentCache.set(documentId, result.json);
+					tags = result.json['tags'];
+				}
+			} catch (error) {
+				console.error('Failed to fetch tags for Paperless document ' + documentId + ':', error);
+			}
+		}
 		if (!Array.isArray(tags)) {
 			console.warn('No cached tags found for Paperless document ' + documentId);
 			return;
@@ -844,8 +857,8 @@ class DocumentSelectorModal extends Modal {
 				try {
 					const tagIds = Array.from(this.selectedTags);
 					const searchResults = await searchPaperlessDocuments(this.settings, searchQuery, tagIds);
-					this.availableDocumentIds = sortDocumentIds(searchResults);
 					if (requestId !== this.searchGeneration) return;
+					this.availableDocumentIds = sortDocumentIds(searchResults);
 				} catch (error) {
 					if (requestId !== this.searchGeneration) return;
 					new Notice('Failed to search documents');
