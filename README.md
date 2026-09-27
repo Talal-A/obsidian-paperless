@@ -14,7 +14,7 @@ This assumes you have a working version of [paperless-ngx](https://github.com/pa
 You must also have the ✨amazing✨ [PDF++](https://github.com/RyotaUshio/obsidian-pdf-plus) plugin installed!
 
 ## How it works
-This plugin interacts with your paperless instance to enable seamless viewing of your documents within Obsidian. When you click on a document to import it will generate a share link from paperless and embed it into a *external PDF file*. Read more [here](https://ryotaushio.github.io/obsidian-pdf-plus/external-pdf-files.html). You can now view that document as though it was natively loaded in your vault, without needing to worry about local or remote storage limits.
+This plugin interacts with your paperless instance to enable seamless viewing of your documents within Obsidian. When you click on a document to import it, it generates a PDF++ dummy `.pdf` file containing only the public Paperless share URL. The actual PDF binary data is not stored in your Obsidian vault. Read more [here](https://ryotaushio.github.io/obsidian-pdf-plus/external-pdf-files.html).
 
 ## Setup
 
@@ -29,7 +29,8 @@ This plugin interacts with your paperless instance to enable seamless viewing of
 4. Fill in the following settings:
     - Paperless URL: full url to your paperless-ngx instance. Do not include the trailing `/`.
     - Paperless authentication token: token you obtained in step 1.
-    - Document storage path: location you would like to save references to these PDFs.
+    - Document storage path: optional location for the PDF++ dummy files. If left empty, references are created in the vault root.
+    - Embed documents: when enabled, inserted documents use `![[paperless-ID.pdf]]`; when disabled, they use `[[paperless-ID.pdf]]`.
 5. Click "Test connection" to confirm connectivity. If any errors appear, you can view them in the console. Open the console using `cmd+option+i` (MacOS) or `ctrl+shift+i` (Windows). 
 
 ## Usage
@@ -50,6 +51,12 @@ The standard insertion command. Please note you must have an open editor focused
 The "Insert document" command caches some information such as available documents, tags, and other metadata when it is first run. If you find that new documents or changes are not showing up in the document selection modal, running this command will refresh the caches.
 
 #### Replace URL with document
-This command replaces a url in a note with an embed of the document. To use:
+This command replaces a url in a note with a document reference. It recognizes both Paperless URLs and existing `[[paperless-ID.pdf]]` references. To use:
 1. Move your cursor onto a paperless url in a note. The url should be of the form `http://ip:port/api/documents/id/preview/` or `http://ip:port/documents/id/details`
 1. Run this command
+
+#### Import missing documents
+This command searches the current Markdown document for `[[paperless-ID.pdf]]` and `![[paperless-ID.pdf]]` references and creates any missing PDF++ dummy files. It does not download PDF binary data into the vault.
+
+## Manual testing
+Test documents with multiple pages and documents with tags. Also test documents whose Paperless share links are missing.
