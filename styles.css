@@ -135,3 +135,9 @@
     border-radius: 4px;
     flex: 1;
 }
+
+.obsidian-paperless-tag-empty {
+    padding: 4px 8px;
+    opacity: 0.6;
+    font-size: 12px;
+}
