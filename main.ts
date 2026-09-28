@@ -1,4 +1,4 @@
-import { App, Editor, EditorRange, Modal, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting, TFolder, TFile } from 'obsidian';
+import { App, Editor, EditorRange, Modal, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting, SettingDefinitionItem, TFolder, TFile } from 'obsidian';
 
 interface PluginSettings {
 	paperlessUrl: string;
@@ -33,7 +33,14 @@ const DEFAULT_SETTINGS: PluginSettings = {
 export default class ObsidianPaperless extends Plugin {
 	settings: PluginSettings;
 
-	async onload() {
+	onload(): void {
+		void this.initialize().catch((error: unknown) => {
+			console.error('Paperless plugin failed to load:', error);
+			new Notice('Paperless plugin failed to load. Check the console for details.');
+		});
+	}
+
+	private async initialize(): Promise<void> {
 		await this.loadSettings();
 
 		this.addCommand({
@@ -84,7 +91,7 @@ export default class ObsidianPaperless extends Plugin {
 				// a refresh that cannot reach paperless becomes an unhandled
 				// promise rejection and the user sees only "Refreshing...".
 				refreshCacheFromPaperless(this.settings, false).catch((error) => {
-					new Notice('Failed to refresh cache: ' + (error && error.message ? error.message : error));
+					new Notice('Failed to refresh cache: ' + errorMessage(error));
 					console.error('Paperless refresh failed:', error);
 				});
 			}
@@ -103,17 +110,54 @@ export default class ObsidianPaperless extends Plugin {
 
 	onunload() {}
 
-	async loadSettings() {
+	async loadSettings(): Promise<void> {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
-	async saveSettings() {
+	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 	}
 }
 
-const documentCache = new Map<string, Record<string, any>>();
-const tagCache = new Map<number, Record<string, any>>();
+type ApiObject = Record<string, unknown>;
+
+interface PaperlessTag {
+	id: number;
+	name: string;
+	textColor: string;
+	color: string;
+}
+
+function isApiObject(value: unknown): value is ApiObject {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function documentId(value: unknown): string | null {
+	if (!isApiObject(value)) {
+		return null;
+	}
+	const id = value.id;
+	return typeof id === 'string' || typeof id === 'number' ? String(id) : null;
+}
+
+function paperlessTag(value: unknown): PaperlessTag | null {
+	if (!isApiObject(value) || typeof value.id !== 'number' || typeof value.name !== 'string') {
+		return null;
+	}
+	return {
+		id: value.id,
+		name: value.name,
+		textColor: typeof value.text_color === 'string' ? value.text_color : '',
+		color: typeof value.color === 'string' ? value.color : ''
+	};
+}
+
+const documentCache = new Map<string, ApiObject>();
+const tagCache = new Map<number, PaperlessTag>();
 
 // Ids of every cached document, in the order paperless returned them.
 let cachedDocumentIds: string[] = [];
@@ -156,35 +200,35 @@ function pageUrl(url: string, page: number): string {
 
 /// Items from a paginated response: "results" (api version >= 10) or the legacy
 /// "all" id list on older instances.
-function extractItems(body: any): any[] {
-	if (!body) {
+function extractItems(body: unknown): unknown[] {
+	if (!isApiObject(body)) {
 		return [];
 	}
-	if (Array.isArray(body['results'])) {
-		return body['results'];
+	if (Array.isArray(body.results)) {
+		return body.results;
 	}
-	if (Array.isArray(body['all'])) {
-		return body['all'];
+	if (Array.isArray(body.all)) {
+		return body.all;
 	}
 	return [];
 }
 
 /// Fetch every item of a paginated paperless endpoint. Stops when the reported
 /// count is reached, so nothing is silently capped at the default 25 per page.
-async function fetchAllResults(settings: PluginSettings, url: string, headers: Record<string, string> = {}, what = 'results'): Promise<any[]> {
+async function fetchAllResults(settings: PluginSettings, url: string, headers: Record<string, string> = {}, what = 'results'): Promise<unknown[]> {
 	const first: RequestUrlResponse = await requestUrl({url: url, headers: authHeaders(settings, headers)});
 	if (first.status != 200) {
 		throw new Error('paperless returned status ' + first.status + ' for ' + url);
 	}
 
-	const body: any = first.json;
+	const body: unknown = first.json;
 	if (Array.isArray(body)) {
 		// Unpaginated endpoint
 		return body.slice();
 	}
 
 	let items = extractItems(body);
-	const count = typeof body['count'] === 'number' ? body['count'] : items.length;
+	const count = isApiObject(body) && typeof body.count === 'number' ? body.count : items.length;
 
 	for (let page = 2; items.length < count && page <= MAX_PAGES; page++) {
 		const result: RequestUrlResponse = await requestUrl({url: pageUrl(url, page), headers: authHeaders(settings, headers)});
@@ -217,7 +261,7 @@ async function testConnection(settings: PluginSettings) {
 				'Authorization': 'token ' + settings.paperlessAuthToken
 			}
 		})
-		if (result.status == 200 && result.json['results']) {
+		if (result.status == 200 && isApiObject(result.json) && Array.isArray(result.json.results)) {
 			new Notice("Connection successful")
 		}
 	} catch(exception) {
@@ -232,11 +276,12 @@ async function refreshCacheFromPaperless(settings: PluginSettings, silent=true) 
 	// ids from "results" (api version >= 10) or the legacy "all" id list.
 	const docUrl = settings.paperlessUrl + '/api/documents/?format=json&page_size=' + PAGE_SIZE;
 	const documents = await fetchAllResults(settings, docUrl, {}, 'documents');
-	cachedDocumentIds = documents.map((d) => String(typeof d === 'object' && d ? d['id'] : d));
+	cachedDocumentIds = documents.map(documentId).filter((id): id is string => id !== null);
 	documentCache.clear();
 	for (const document of documents) {
-		if (document && typeof document === 'object' && document['id'] !== undefined) {
-			documentCache.set(String(document['id']), document);
+		const id = documentId(document);
+		if (id !== null && isApiObject(document)) {
+			documentCache.set(id, document);
 		}
 	}
 	cacheLoaded = true;
@@ -253,15 +298,16 @@ async function refreshCacheFromPaperless(settings: PluginSettings, silent=true) 
 		const tags = await fetchAllResults(settings, tagUrl, {}, 'tags');
 		if (tags.length > 0) {
 			tagCache.clear();
-			for (let current of tags) {
-				if (current && current['id'] !== undefined) {
-					tagCache.set(current['id'], current);
+			for (const current of tags) {
+				const tag = paperlessTag(current);
+				if (tag) {
+					tagCache.set(tag.id, tag);
 				}
 			}
 		}
 	} catch (error) {
 		console.error('Paperless: fetching tags failed, keeping any cached tags:', error);
-		refreshWarnings.push('tags could not be loaded (' + (error && error.message ? error.message : error) + ')');
+		refreshWarnings.push('tags could not be loaded (' + errorMessage(error) + ')');
 	}
 	if(!silent) {
 		const suffix = refreshWarnings.length > 0 ? ' (' + refreshWarnings.join('; ') + ')' : '';
@@ -340,7 +386,7 @@ interface VersionChoice {
 }
 
 /// Look up a document's metadata. Returns null if it cannot be read.
-async function fetchDocumentInfo(settings: PluginSettings, documentId: string): Promise<any | null> {
+async function fetchDocumentInfo(settings: PluginSettings, documentId: string): Promise<ApiObject | null> {
 	const url = new URL(settings.paperlessUrl + '/api/documents/' + documentId + '/?format=json');
 	try {
 		const result = await requestUrl({
@@ -353,7 +399,7 @@ async function fetchDocumentInfo(settings: PluginSettings, documentId: string): 
 			console.error('An exception occurred in fetchDocumentInfo. Response:', result);
 			return null;
 		}
-		return result.json;
+		return isApiObject(result.json) ? result.json : null;
 	} catch (e) {
 		console.error("An exception occurred in fetchDocumentInfo. Exception: " + e);
 		return null;
@@ -373,8 +419,8 @@ async function resolveFileVersion(settings: PluginSettings, documentId: string):
 		return {version: DEFAULT_SHARE_FILE_VERSION, hasArchive: false, originalName: null, archivedName: null};
 	}
 
-	const originalName: string | null = doc['original_file_name'] || null;
-	const archivedName: string | null = doc['archived_file_name'] || null;
+	const originalName = typeof doc.original_file_name === 'string' ? doc.original_file_name : null;
+	const archivedName = typeof doc.archived_file_name === 'string' ? doc.archived_file_name : null;
 
 	if (archivedName && (!originalName || archivedName != originalName)) {
 		// A separate archived version exists, i.e. the original is not a pdf.
@@ -387,21 +433,21 @@ async function resolveFileVersion(settings: PluginSettings, documentId: string):
 /// Find the share link we previously created for this document version.
 /// file_version is part of the share link API since paperless-ngx 2.0; on older
 /// instances the field is absent and can only be matched loosely.
-function shareLinkItems(json: any): any[] {
+function shareLinkItems(json: unknown): ApiObject[] {
 	if (Array.isArray(json)) {
-		return json;
+		return json.filter(isApiObject);
 	}
-	if (json && Array.isArray(json['results'])) {
-		return json['results'];
+	if (isApiObject(json) && Array.isArray(json.results)) {
+		return json.results.filter(isApiObject);
 	}
 	return [];
 }
 
-function findExistingLink(json: any, version: FileVersion) {
+function findExistingLink(json: unknown, version: FileVersion): ApiObject | null {
 	const items = shareLinkItems(json);
 
-	for (let item of items) {
-		if (item['expiration'] == null && item['file_version'] === version) {
+	for (const item of items) {
+		if (item.expiration == null && item.file_version === version) {
 			return item;
 		}
 	}
@@ -409,8 +455,8 @@ function findExistingLink(json: any, version: FileVersion) {
 	// Instances predating the file_version field served share links from the
 	// original file, so such a link is only a valid match for that version.
 	if (version === 'original') {
-		for (let item of items) {
-			if (item['expiration'] == null && item['file_version'] === undefined) {
+		for (const item of items) {
+			if (item.expiration == null && item.file_version === undefined) {
 				return item;
 			}
 		}
@@ -437,9 +483,9 @@ async function getExistingShareLink(settings: PluginSettings, documentId: string
 			console.error('An exception occurred in getExistingShareLink. Response:', result);
 			return null;
 		}
-		let item = findExistingLink(result.json, fileVersion);
-		if (item) {
-			return {url: makeShareUrl(settings, item['slug']), fileVersion: fileVersion};
+		const item = findExistingLink(result.json, fileVersion);
+		if (item && typeof item.slug === 'string') {
+			return {url: makeShareUrl(settings, item.slug), fileVersion: fileVersion};
 		}
 	} catch (e) {
 		console.error('An exception occurred in getExistingShareLink.', e, result);
@@ -461,8 +507,8 @@ async function createShareLink(settings: PluginSettings, documentId: string, fil
 				'Authorization': 'token ' + settings.paperlessAuthToken
 			}
 		})
-		if (result.status === 201 && result.json['slug']) {
-			return result.json['slug'];
+		if (result.status === 201 && isApiObject(result.json) && typeof result.json.slug === 'string') {
+			return result.json.slug;
 		}
 	} catch (e) {
 		console.error('An exception occurred in createShareLink.', e, result);
@@ -615,8 +661,8 @@ async function insertDocumentLink(editor: Editor, settings: PluginSettings, docu
 			url: url.toString(),
 			headers: { 'Authorization': 'token ' + settings.paperlessAuthToken }
 		});
-		if (result.status === 200 && result.json['title']) {
-			title = result.json['title'];
+		if (result.status === 200 && isApiObject(result.json) && typeof result.json.title === 'string') {
+			title = result.json.title;
 		}
 	} catch (e) {
 		console.error('Failed to fetch document title:', e);
@@ -636,7 +682,7 @@ async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: s
 	const url = new URL(urlStr);
 	try {
 		const documents = await fetchAllResults(settings, url.toString(), {}, 'search results');
-		return documents.map((d) => String(typeof d === 'object' && d ? d['id'] : d));
+		return documents.map(documentId).filter((id): id is string => id !== null);
 	} catch (error) {
 		console.error('Error searching Paperless:', error);
 		throw error;
@@ -733,7 +779,7 @@ class DocumentSelectorModal extends Modal {
 		imgElement.src = URL.createObjectURL(new Blob([result.arrayBuffer]));
 	}
 
-	async displayTags(tagDiv: HTMLDivElement, documentId: string) {
+	async displayTags(tagDiv: HTMLDivElement, documentId: string): Promise<void> {
 		let tags = documentCache.get(documentId)?.tags;
 		if (!Array.isArray(tags)) {
 			try {
@@ -742,8 +788,10 @@ class DocumentSelectorModal extends Modal {
 					headers: {'Authorization': 'token ' + this.settings.paperlessAuthToken}
 				});
 				if (result.status === 200) {
-					documentCache.set(documentId, result.json);
-					tags = result.json['tags'];
+					if (isApiObject(result.json)) {
+						documentCache.set(documentId, result.json);
+						tags = result.json.tags;
+					}
 				}
 			} catch (error) {
 				console.error('Failed to fetch tags for Paperless document ' + documentId + ':', error);
@@ -753,19 +801,29 @@ class DocumentSelectorModal extends Modal {
 			console.warn('No cached tags found for Paperless document ' + documentId);
 			return;
 		}
-		for (let x = 0; x < tags.length; x++) {
+		for (const tagId of tags) {
+			if (typeof tagId !== 'number') {
+				continue;
+			}
 			const currentTag = tagDiv.createDiv();
-			const tagData = tagCache.get(tags[x]);
+			const tagData = tagCache.get(tagId);
 			if (!tagData) {
 				continue;
 			}
-			const tagStr = currentTag.createSpan({text: tagData['name']});
-			tagStr.setCssStyles({color: tagData['text_color'], fontSize: '0.7em'});
-			currentTag.setCssStyles({background: tagData['color'], borderRadius: '8px', padding: '2px', marginTop: '1px', marginRight: '5px'})
+			const tagStr = currentTag.createSpan({text: tagData.name});
+			tagStr.setCssStyles({color: tagData.textColor, fontSize: '0.7em'});
+			currentTag.setCssStyles({background: tagData.color, borderRadius: '8px', padding: '2px', marginTop: '1px', marginRight: '5px'})
 		}
 	}
 
-	async onOpen() {
+	onOpen(): void {
+		void this.openSelector().catch((error: unknown) => {
+			console.error('Paperless document selector failed to open:', error);
+			new Notice('Paperless document selector failed to open. Check the console for details.');
+		});
+	}
+
+	private async openSelector(): Promise<void> {
 		const {contentEl} = this;
 		if (!cacheLoaded) {
 			try {
@@ -773,7 +831,7 @@ class DocumentSelectorModal extends Modal {
 			} catch (error) {
 				console.error('Paperless: initial cache load failed:', error);
 				new Notice('Paperless: could not load documents. ' +
-					(error && error.message ? error.message : error) +
+					errorMessage(error) +
 					' Use the refresh button to retry.');
 			}
 		}
@@ -803,17 +861,16 @@ class DocumentSelectorModal extends Modal {
 
 		// Populate tag dropdown
 		const tags = Array.from(tagCache.entries())
-			.filter(([, tagData]) => !!tagData && typeof tagData['name'] === 'string')
-			.sort((a, b) => a[1]['name'].localeCompare(b[1]['name']));
+			.sort((a, b) => a[1].name.localeCompare(b[1].name));
 		for (const [tagId, tagData] of tags) {
 			const tagItem = tagDropdown.createDiv({cls: 'obsidian-paperless-tag-item'});
 
 			const checkbox = tagItem.createEl('input', {type: 'checkbox'});
 
-			const tagLabel = tagItem.createSpan({text: tagData['name']});
+			const tagLabel = tagItem.createSpan({text: tagData.name});
 			tagLabel.setCssProps({
-				color: tagData['text_color'],
-				background: tagData['color']
+				color: tagData.textColor,
+				background: tagData.color
 			});
 
 			const updateTagSelection = () => {
@@ -883,7 +940,7 @@ class DocumentSelectorModal extends Modal {
 				void this.onOpen();
 			} catch (error) {
 				// message, so API failures are visible in the UI too
-				new Notice('Failed to refresh cache: ' + (error && error.message ? error.message : error));
+				new Notice('Failed to refresh cache: ' + errorMessage(error));
 				console.error('Refresh failed:', error);
 				refreshButton.disabled = false;
 				refreshButton.setText('\u21bb Refresh');
@@ -1111,28 +1168,69 @@ class SettingTab extends PluginSettingTab {
 	display(): void {
 		const {containerEl} = this;
 		containerEl.empty();
+		this.renderPaperlessUrl(new Setting(containerEl));
+		this.renderAuthToken(new Setting(containerEl));
+		this.renderDocumentStoragePath(new Setting(containerEl));
+		this.renderEmbedDocuments(new Setting(containerEl));
+		this.renderTestConnection(new Setting(containerEl));
+	}
 
-		new Setting(containerEl)
-		.setName('Paperless URL')
-		.setDesc('Full URL to your paperless instance.')
-		.addText(text => text
-			.setValue(this.plugin.settings.paperlessUrl)
-			.onChange(async (value) => {
-				this.plugin.settings.paperlessUrl = value;
-				await this.plugin.saveSettings();
-			}));
-		new Setting(containerEl)
-			.setName('Paperless authentication token')
-			.setDesc('Token obtained using https://docs.paperless-ngx.com/api/#authorization')
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		return [
+			{
+				name: 'Paperless URL',
+				desc: 'Full URL to your paperless instance.',
+				render: (setting: Setting) => this.renderPaperlessUrl(setting)
+			},
+			{
+				name: 'Paperless authentication token',
+				desc: 'Token obtained using https://docs.paperless-ngx.com/api/#authorization',
+				render: (setting: Setting) => this.renderAuthToken(setting)
+			},
+			{
+				name: 'Document storage path',
+				desc: 'Location for stored documents.',
+				render: (setting: Setting) => this.renderDocumentStoragePath(setting)
+			},
+			{
+				name: 'Embed documents',
+				desc: 'When enabled, new documents are inserted as embedded PDFs (![[...]]). Otherwise as links ([[...]]).',
+				render: (setting: Setting) => this.renderEmbedDocuments(setting)
+			},
+			{
+				name: 'Test connection',
+				desc: 'Validate the connection between obsidian and your paperless instance.',
+				render: (setting: Setting) => this.renderTestConnection(setting)
+			}
+		];
+	}
+
+	private renderPaperlessUrl(setting: Setting): void {
+		setting.setName('Paperless URL')
+			.setDesc('Full URL to your paperless instance.')
 			.addText(text => text
-				.setValue(this.plugin.settings.paperlessAuthToken)
+				.setValue(this.plugin.settings.paperlessUrl)
 				.onChange(async (value) => {
-					this.plugin.settings.paperlessAuthToken = value;
+					this.plugin.settings.paperlessUrl = value;
 					await this.plugin.saveSettings();
-				})
-				.inputEl.type = 'password');
-		new Setting(containerEl)
-			.setName('Document storage path')
+				}));
+	}
+
+	private renderAuthToken(setting: Setting): void {
+		setting.setName('Paperless authentication token')
+			.setDesc('Token obtained using https://docs.paperless-ngx.com/api/#authorization')
+			.addText(text => {
+				text.setValue(this.plugin.settings.paperlessAuthToken)
+					.onChange(async (value) => {
+						this.plugin.settings.paperlessAuthToken = value;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.type = 'password';
+			});
+	}
+
+	private renderDocumentStoragePath(setting: Setting): void {
+		setting.setName('Document storage path')
 			.setDesc('Location for stored documents.')
 			.addText(text => text
 				.setValue(this.plugin.settings.documentStoragePath)
@@ -1140,8 +1238,10 @@ class SettingTab extends PluginSettingTab {
 					this.plugin.settings.documentStoragePath = value;
 					await this.plugin.saveSettings();
 				}));
-		new Setting(containerEl)
-			.setName('Embed documents')
+	}
+
+	private renderEmbedDocuments(setting: Setting): void {
+		setting.setName('Embed documents')
 			.setDesc('When enabled, new documents are inserted as embedded PDFs (![[...]]). Otherwise as links ([[...]]).')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.embedDocuments)
@@ -1149,14 +1249,16 @@ class SettingTab extends PluginSettingTab {
 					this.plugin.settings.embedDocuments = value;
 					await this.plugin.saveSettings();
 				}));
-		new Setting(containerEl)
-			.setName('Test connection')
+	}
+
+	private renderTestConnection(setting: Setting): void {
+		setting.setName('Test connection')
 			.setDesc('Validate the connection between obsidian and your paperless instance.')
-			.addButton((button) => {
-				button.setButtonText("Test connection")
+			.addButton(button => {
+				button.setButtonText('Test connection');
 				button.onClick(() => {
 					void testConnection(this.plugin.settings);
-				})
-			})
+				});
+			});
 	}
 }
